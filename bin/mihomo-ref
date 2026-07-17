@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ACTION="${1:-}"
+SHELL_PID="${2:-}"
+
+BASE_DIR="${XDG_RUNTIME_DIR:-/tmp/mihomo-proxy-${UID}}/mihomo-proxy"
+USERS_DIR="$BASE_DIR/users"
+LOCK_FILE="$BASE_DIR/lock"
+SYSTEMCTL="/usr/bin/systemctl"
+SERVICE="${MIHOMO_SERVICE:-mihomo.service}"
+
+mkdir -p "$USERS_DIR"
+chmod 700 "$BASE_DIR" "$USERS_DIR"
+
+cleanup_stale() {
+    local marker pid saved_start current_start
+
+    shopt -s nullglob
+
+    for marker in "$USERS_DIR"/*; do
+        pid="${marker##*/}"
+
+        if [[ ! "$pid" =~ ^[0-9]+$ ]] ||
+           [[ ! -r "$marker" ]] ||
+           [[ ! -r "/proc/$pid/stat" ]]; then
+            rm -f -- "$marker"
+            continue
+        fi
+
+        saved_start="$(cat "$marker" 2>/dev/null || true)"
+        current_start="$(
+            awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true
+        )"
+
+        # 防止 PID 被系统重新分配给其他进程
+        if [[ -z "$saved_start" ||
+              "$saved_start" != "$current_start" ]]; then
+            rm -f -- "$marker"
+        fi
+    done
+}
+
+count_users() {
+    find "$USERS_DIR" -maxdepth 1 -type f -printf '.' |
+        wc -c |
+        tr -d ' '
+}
+
+count_after_cleanup() {
+    local count
+
+    cleanup_stale
+    count="$(count_users)"
+
+    printf '%s\n' "$count"
+}
+
+exec 9>"$LOCK_FILE"
+flock -x 9
+
+cleanup_stale
+
+case "$ACTION" in
+    acquire)
+        if [[ ! "$SHELL_PID" =~ ^[0-9]+$ ]] ||
+           [[ ! -r "/proc/$SHELL_PID/stat" ]]; then
+            echo "无法识别当前 Shell 进程。" >&2
+            exit 2
+        fi
+
+        if ! "$SYSTEMCTL" is-active --quiet "$SERVICE"; then
+            sudo -n "$SYSTEMCTL" start "$SERVICE"
+        fi
+
+        awk '{print $22}' "/proc/$SHELL_PID/stat" \
+            > "$USERS_DIR/$SHELL_PID"
+
+        count_users
+        ;;
+
+    release)
+        if [[ ! "$SHELL_PID" =~ ^[0-9]+$ ]]; then
+            echo "无效的 Shell PID。" >&2
+            exit 2
+        fi
+
+        rm -f -- "$USERS_DIR/$SHELL_PID"
+        count_after_cleanup
+        ;;
+
+    gc)
+        count_after_cleanup
+        ;;
+
+    status)
+        cleanup_stale
+        count_users
+        ;;
+
+    list)
+        cleanup_stale
+
+        shopt -s nullglob
+        markers=("$USERS_DIR"/*)
+
+        if (( ${#markers[@]} == 0 )); then
+            echo "没有终端登记使用代理。"
+            exit 0
+        fi
+
+        for marker in "${markers[@]}"; do
+            pid="${marker##*/}"
+            ps -p "$pid" \
+                -o pid=,ppid=,tty=,stat=,etimes=,comm= \
+                2>/dev/null || true
+        done
+        ;;
+
+    *)
+        echo "用法：mihomo-ref acquire|release|gc|status|list [shell-pid]" >&2
+        exit 2
+        ;;
+esac

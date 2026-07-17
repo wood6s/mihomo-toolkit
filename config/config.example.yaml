@@ -1,0 +1,54 @@
+# Safe, credential-free baseline derived from the local host configuration.
+mixed-port: 7890
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: info
+external-controller: "127.0.0.1:9090"
+
+dns:
+  enable: true
+  ipv6: false
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  use-hosts: true
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback:
+    - https://doh-pure.onedns.net/dns-query
+    - https://ada.openbld.net/dns-query
+    - https://223.5.5.5/dns-query
+    - https://223.6.6.6/dns-query
+  fallback-filter:
+    geoip: false
+    ipcidr:
+      - 240.0.0.0/4
+      - 0.0.0.0/32
+
+# This placeholder is deliberately non-functional. Replace it locally or use proxy_add.
+proxies:
+  - name: "示例节点"
+    type: ss
+    server: example.invalid
+    port: 443
+    cipher: aes-128-gcm
+    password: "<REPLACE_WITH_NODE_PASSWORD>"
+
+# Keep the main Selector as a one-line mapping: the subscription manager edits it
+# conservatively and refuses unfamiliar layouts.
+proxy-groups:
+  - { name: "默认代理", type: select, proxies: ["自动选择", "手动选择", DIRECT] }
+  - { name: "手动选择", type: select, proxies: ["示例节点"] }
+  - { name: "自动选择", type: url-test, proxies: ["示例节点"], url: "https://www.gstatic.com/generate_204", interval: 300, tolerance: 50 }
+
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - MATCH,默认代理

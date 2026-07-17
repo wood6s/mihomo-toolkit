@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""Safely manage a small, marked proxy-providers block in Mihomo config."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from urllib.parse import urlsplit
+
+import yaml
+
+
+CONFIG = Path(os.environ.get("MIHOMO_CONFIG", "/etc/mihomo/config.yaml"))
+STATE = Path(os.environ.get("MIHOMO_STATE", "/etc/mihomo/.managed-subscriptions.json"))
+BACKUP_DIR = Path(
+    os.environ.get("MIHOMO_BACKUP_DIR", "/etc/mihomo/subscription-backups")
+)
+LOCK = Path(os.environ.get("MIHOMO_LOCK", "/run/lock/mihomo-subscriptions.lock"))
+MIHOMO = Path(os.environ.get("MIHOMO_BIN", "/usr/local/bin/mihomo"))
+SYSTEMCTL = Path(os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl"))
+SERVICE = os.environ.get("MIHOMO_SERVICE", "mihomo.service")
+
+ID_PREFIX = "managed_sub_"
+BEGIN_PROVIDERS = "# BEGIN MIHOMO MANAGED SUBSCRIPTIONS"
+END_PROVIDERS = "# END MIHOMO MANAGED SUBSCRIPTIONS"
+BEGIN_GROUPS = "# BEGIN MIHOMO MANAGED SUBSCRIPTION GROUPS"
+END_GROUPS = "# END MIHOMO MANAGED SUBSCRIPTION GROUPS"
+
+
+class ManagerError(RuntimeError):
+    pass
+
+
+def fail(message: str, code: int = 1) -> "None":
+    print(f"错误：{message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        fail("请通过 sudo 运行此管理程序。")
+
+
+def validate_label(label: str) -> str:
+    label = label.strip()
+    if not label:
+        raise ManagerError("订阅名称不能为空。")
+    if len(label) > 40:
+        raise ManagerError("订阅名称不能超过 40 个字符。")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in label):
+        raise ManagerError("订阅名称不能包含控制字符。")
+    return label
+
+
+def validate_url(raw: str) -> str:
+    url = raw.rstrip("\r\n")
+    if not url or "\n" in url or "\r" in url:
+        raise ManagerError("订阅地址为空或包含换行符。")
+    if len(url) > 8192:
+        raise ManagerError("订阅地址过长。")
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ManagerError("为防止订阅令牌被明文传输，只接受有效的 HTTPS 地址。")
+    if parsed.username or parsed.password:
+        raise ManagerError("订阅地址不能使用 user:password@host 形式。")
+    return url
+
+
+def subscription_id(label: str) -> str:
+    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+    return f"{ID_PREFIX}{digest}"
+
+
+def load_state(config_text: str) -> dict:
+    has_markers = any(
+        marker in config_text
+        for marker in (BEGIN_PROVIDERS, END_PROVIDERS, BEGIN_GROUPS, END_GROUPS)
+    )
+    if not STATE.exists():
+        if has_markers:
+            raise ManagerError("发现受管配置区块，但状态文件缺失；为避免误删，已停止操作。")
+        return {"version": 1, "target_group": "", "subscriptions": []}
+
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManagerError(f"无法读取订阅状态文件：{exc}") from exc
+
+    if data.get("version") != 1 or not isinstance(data.get("subscriptions"), list):
+        raise ManagerError("订阅状态文件格式不受支持。")
+    return data
+
+
+def strip_provider_block(text: str) -> str:
+    has_begin = BEGIN_PROVIDERS in text
+    has_end = END_PROVIDERS in text
+    if has_begin != has_end:
+        raise ManagerError("受管配置区块的起止标记不完整。")
+    if not has_begin:
+        return text
+
+    pattern = re.compile(
+        rf"(?ms)^{re.escape(BEGIN_PROVIDERS)}\n.*?^{re.escape(END_PROVIDERS)}\n?"
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        raise ManagerError("受管配置区块数量异常。")
+    return pattern.sub("", text, count=1)
+
+
+def strip_group_block(text: str) -> str:
+    has_begin = BEGIN_GROUPS in text
+    has_end = END_GROUPS in text
+    if has_begin != has_end:
+        raise ManagerError("受管策略组区块的起止标记不完整。")
+    if not has_begin:
+        return text
+
+    pattern = re.compile(
+        rf"(?ms)^[ \t]*{re.escape(BEGIN_GROUPS)}\n.*?^[ \t]*{re.escape(END_GROUPS)}\n?"
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        raise ManagerError("受管策略组区块数量异常。")
+    return pattern.sub("", text, count=1)
+
+
+def load_yaml(text: str) -> dict:
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ManagerError(f"当前 Mihomo 配置不是有效 YAML：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ManagerError("Mihomo 配置顶层必须是映射。")
+    return data
+
+
+def choose_target_group(data: dict) -> str:
+    groups = data.get("proxy-groups") or []
+    selectors = {
+        group.get("name")
+        for group in groups
+        if isinstance(group, dict) and group.get("type") == "select"
+    }
+
+    for rule in reversed(data.get("rules") or []):
+        if not isinstance(rule, str):
+            continue
+        parts = [part.strip() for part in rule.split(",")]
+        if len(parts) >= 2 and parts[0].upper() == "MATCH" and parts[-1] in selectors:
+            return parts[-1]
+
+    if len(selectors) == 1:
+        return next(iter(selectors))
+    raise ManagerError("无法自动确定主 Selector 策略组。")
+
+
+def find_inline_group(lines: list[str], name: str) -> tuple[int, str, dict, str]:
+    pg_index = next(
+        (i for i, line in enumerate(lines) if re.match(r"^proxy-groups:\s*(?:#.*)?$", line.rstrip("\n"))),
+        None,
+    )
+    if pg_index is None:
+        raise ManagerError("找不到 proxy-groups 配置段。")
+
+    section_end = len(lines)
+    for i in range(pg_index + 1, len(lines)):
+        if re.match(r"^[^\s#][^:]*:\s*", lines[i]):
+            section_end = i
+            break
+
+    found: list[tuple[int, str, dict, str]] = []
+    for i in range(pg_index + 1, section_end):
+        line = lines[i]
+        match = re.match(r"^(\s*)-\s*(\{.*\})\s*$", line.rstrip("\n"))
+        if not match:
+            continue
+        try:
+            group = yaml.safe_load(match.group(2))
+        except yaml.YAMLError:
+            continue
+        if isinstance(group, dict) and group.get("name") == name:
+            found.append((i, match.group(1), group, "\n" if line.endswith("\n") else ""))
+
+    if len(found) != 1:
+        raise ManagerError(
+            f"策略组 {name!r} 不是唯一的单行映射，脚本拒绝冒险改写。"
+        )
+    return found[0]
+
+
+def dump_flow(value: dict) -> str:
+    dumped = yaml.safe_dump(
+        value,
+        allow_unicode=True,
+        default_flow_style=True,
+        sort_keys=False,
+        width=1_000_000,
+    ).strip()
+    if "\n" in dumped:
+        raise ManagerError("策略组过长，无法安全保持为单行格式。")
+    return dumped
+
+
+def rewrite_rule_targets(text: str, old_target: str, new_target: str) -> tuple[str, int]:
+    lines = text.splitlines(keepends=True)
+    rules_index = next(
+        (i for i, line in enumerate(lines) if re.match(r"^rules:\s*(?:#.*)?$", line.rstrip("\n"))),
+        None,
+    )
+    if rules_index is None:
+        raise ManagerError("找不到 rules 配置段。")
+
+    section_end = len(lines)
+    for i in range(rules_index + 1, len(lines)):
+        if re.match(r"^[^\s#][^:]*:\s*", lines[i]):
+            section_end = i
+            break
+
+    changed = 0
+    for i in range(rules_index + 1, section_end):
+        line = lines[i]
+        match = re.match(r"^(\s*)-\s*(.*?)\s*$", line.rstrip("\n"))
+        if not match:
+            continue
+        try:
+            rule = yaml.safe_load(match.group(2))
+        except yaml.YAMLError:
+            continue
+        if not isinstance(rule, str) or "," not in rule:
+            continue
+        prefix, policy = rule.rsplit(",", 1)
+        if policy.strip() != old_target:
+            continue
+        rewritten = f"{prefix},{new_target}"
+        newline = "\n" if line.endswith("\n") else ""
+        lines[i] = f"{match.group(1)}- {json.dumps(rewritten, ensure_ascii=False)}{newline}"
+        changed += 1
+    return "".join(lines), changed
+
+
+def rewrite_group_layout(
+    text: str,
+    existing_group: str,
+    entry_group: str,
+    entries: list[dict],
+) -> str:
+    text = strip_group_block(text)
+    data = load_yaml(text)
+    legacy_name = f"{existing_group}（现有订阅）"
+    group_names = {
+        group.get("name")
+        for group in data.get("proxy-groups") or []
+        if isinstance(group, dict) and isinstance(group.get("name"), str)
+    }
+
+    lines = text.splitlines(keepends=True)
+    if existing_group in group_names and legacy_name not in group_names:
+        index, indent, subscription_group, newline = find_inline_group(lines, existing_group)
+        existing_use = subscription_group.get("use") or []
+        if not isinstance(existing_use, list) or not all(isinstance(v, str) for v in existing_use):
+            raise ManagerError(f"策略组 {existing_group!r} 的 use 字段格式异常。")
+        unmanaged_use = [value for value in existing_use if not value.startswith(ID_PREFIX)]
+        if unmanaged_use:
+            subscription_group["use"] = unmanaged_use
+        else:
+            subscription_group.pop("use", None)
+        lines[index] = f"{indent}- {dump_flow(subscription_group)}{newline}"
+    elif legacy_name in group_names and existing_group not in group_names:
+        # 兼容中间版本布局，恢复原有 Selector 名称。
+        index, indent, subscription_group, newline = find_inline_group(lines, legacy_name)
+        subscription_group["name"] = existing_group
+        lines[index] = f"{indent}- {dump_flow(subscription_group)}{newline}"
+    else:
+        raise ManagerError("无法唯一识别现有订阅策略组，已停止操作。")
+
+    text = "".join(lines)
+    data = load_yaml(text)
+    occupied = {
+        item.get("name")
+        for key in ("proxy-groups", "proxies")
+        for item in (data.get(key) or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if entry_group in occupied:
+        raise ManagerError(f"总入口名称与现有代理或策略组冲突：{entry_group}")
+    occupied.add(entry_group)
+
+    labels = [entry["label"] for entry in entries]
+    if len({label.casefold() for label in labels}) != len(labels):
+        raise ManagerError("订阅策略组名称存在重复。")
+    collisions = [label for label in labels if label in occupied]
+    if collisions:
+        raise ManagerError(f"订阅名称与现有代理或策略组冲突：{collisions[0]}")
+
+    pg_match = re.search(r"(?m)^proxy-groups:\s*(?:#.*)?$", text)
+    if not pg_match:
+        raise ManagerError("找不到 proxy-groups 配置段。")
+
+    managed_groups = [
+        {"name": entry_group, "type": "select", "proxies": [existing_group] + labels}
+    ]
+    managed_groups.extend(
+        {"name": entry["label"], "type": "select", "use": [entry["id"]]}
+        for entry in entries
+    )
+    group_lines = [f"{indent}{BEGIN_GROUPS}"]
+    group_lines.extend(f"{indent}- {dump_flow(group)}" for group in managed_groups)
+    group_lines.append(f"{indent}{END_GROUPS}")
+    block = "\n".join(group_lines) + "\n"
+    insert_at = pg_match.end()
+    text = text[:insert_at] + "\n" + block + text[insert_at + 1 :]
+    text, _ = rewrite_rule_targets(text, existing_group, entry_group)
+    return text
+
+
+def provider_block(entries: list[dict]) -> str:
+    lines = [BEGIN_PROVIDERS, "proxy-providers:"]
+    for entry in entries:
+        provider_id = entry["id"]
+        label = json.dumps(entry["label"], ensure_ascii=False)
+        url = json.dumps(entry["url"], ensure_ascii=False)
+        prefix = json.dumps(f"[{entry['label']}] ", ensure_ascii=False)
+        lines.extend(
+            [
+                f"    {provider_id}:",
+                "        type: http",
+                f"        url: {url}",
+                f"        path: ./proxy_providers/{provider_id}.yaml",
+                "        interval: 86400",
+                "        health-check:",
+                "            enable: true",
+                "            url: https://www.gstatic.com/generate_204",
+                "            interval: 600",
+                "            timeout: 5000",
+                "            lazy: true",
+                "        override:",
+                f"            additional-prefix: {prefix}",
+            ]
+        )
+    lines.append(END_PROVIDERS)
+    return "\n".join(lines)
+
+
+def render_config(original: str, state: dict) -> str:
+    base = strip_provider_block(original)
+    config_without_managed_groups = strip_group_block(base)
+    data = load_yaml(config_without_managed_groups)
+
+    if "proxy-providers" in data:
+        raise ManagerError(
+            "配置中存在非本工具管理的 proxy-providers；为避免覆盖，已停止操作。"
+        )
+
+    existing_group = (
+        state.get("existing_group")
+        or state.get("target_group")
+        or choose_target_group(data)
+    )
+    entry_group = state.get("entry_group") or "代理选择"
+    entries = state.get("subscriptions") or []
+    provider_ids = [entry["id"] for entry in entries]
+
+    base = rewrite_group_layout(base, existing_group, entry_group, entries)
+    if entries:
+        match = re.search(r"(?m)^proxy-groups:\s*(?:#.*)?$", base)
+        if not match:
+            raise ManagerError("找不到 proxy-groups 插入位置。")
+        block = provider_block(entries) + "\n\n"
+        base = base[: match.start()] + block + base[match.start() :]
+
+    rendered = load_yaml(base)
+    actual_providers = rendered.get("proxy-providers") or {}
+    if set(actual_providers) != set(provider_ids):
+        raise ManagerError("生成配置中的 provider 列表校验失败。")
+
+    entry_groups = [
+        group
+        for group in rendered.get("proxy-groups") or []
+        if isinstance(group, dict) and group.get("name") == entry_group
+    ]
+    if len(entry_groups) != 1:
+        raise ManagerError("生成配置中的订阅总入口校验失败。")
+    expected_groups = [existing_group] + [entry["label"] for entry in entries]
+    if entry_groups[0].get("type") != "select" or entry_groups[0].get("proxies") != expected_groups:
+        raise ManagerError("总入口策略组结构校验失败。")
+    existing_groups = [
+        group for group in rendered.get("proxy-groups") or []
+        if isinstance(group, dict) and group.get("name") == existing_group
+    ]
+    if len(existing_groups) != 1 or existing_groups[0].get("type") != "select":
+        raise ManagerError("现有订阅策略组校验失败。")
+    for entry in entries:
+        groups = [
+            group for group in rendered.get("proxy-groups") or []
+            if isinstance(group, dict) and group.get("name") == entry["label"]
+        ]
+        if len(groups) != 1 or groups[0].get("type") != "select" or groups[0].get("use") != [entry["id"]]:
+            raise ManagerError(f"订阅 {entry['label']!r} 的独立策略组校验失败。")
+
+    routed_to_entry = any(
+        isinstance(rule, str)
+        and "," in rule
+        and rule.rsplit(",", 1)[-1].strip() == entry_group
+        for rule in rendered.get("rules") or []
+    )
+    if not routed_to_entry:
+        raise ManagerError("没有任何规则指向订阅总入口，已停止操作。")
+
+    state["existing_group"] = existing_group
+    state["entry_group"] = entry_group
+    state.pop("target_group", None)
+    return base
+
+
+def write_atomic(path: Path, content: bytes, uid: int, gid: int, mode: int) -> None:
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temp_path, uid, gid)
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def test_config(content: str, config_stat: os.stat_result, secrets: list[str]) -> None:
+    fd, temp_name = tempfile.mkstemp(prefix=".config-test-", suffix=".yaml", dir=CONFIG.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temp_path, config_stat.st_uid, config_stat.st_gid)
+        os.chmod(temp_path, stat.S_IMODE(config_stat.st_mode))
+        result = subprocess.run(
+            [str(MIHOMO), "-t", "-d", str(CONFIG.parent), "-f", str(temp_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            output = result.stdout[-4000:]
+            for secret in secrets:
+                output = output.replace(secret, "<redacted>")
+            raise ManagerError(f"Mihomo 配置测试失败，未写入任何修改：\n{output}")
+    except subprocess.TimeoutExpired as exc:
+        raise ManagerError("Mihomo 配置测试超时，未写入任何修改。") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def backup_current() -> tuple[Path, Path | None]:
+    BACKUP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chown(BACKUP_DIR, 0, 0)
+    os.chmod(BACKUP_DIR, 0o700)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    config_backup = BACKUP_DIR / f"config.yaml.{stamp}"
+    shutil.copy2(CONFIG, config_backup)
+    os.chown(config_backup, 0, 0)
+    os.chmod(config_backup, 0o600)
+
+    state_backup = None
+    if STATE.exists():
+        state_backup = BACKUP_DIR / f"state.json.{stamp}"
+        shutil.copy2(STATE, state_backup)
+        os.chown(state_backup, 0, 0)
+        os.chmod(state_backup, 0o600)
+    return config_backup, state_backup
+
+
+def save_state(state_data: dict) -> None:
+    payload = (json.dumps(state_data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    write_atomic(STATE, payload, 0, 0, 0o600)
+
+
+def apply_change(old_text: str, old_state: bytes | None, state_data: dict) -> Path:
+    config_stat = CONFIG.stat()
+    new_text = render_config(old_text, state_data)
+    secrets = [entry["url"] for entry in state_data.get("subscriptions") or []]
+    test_config(new_text, config_stat, secrets)
+    config_backup, _ = backup_current()
+
+    try:
+        write_atomic(
+            CONFIG,
+            new_text.encode("utf-8"),
+            config_stat.st_uid,
+            config_stat.st_gid,
+            stat.S_IMODE(config_stat.st_mode),
+        )
+        save_state(state_data)
+        result = subprocess.run(
+            [str(SYSTEMCTL), "restart", SERVICE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        active = subprocess.run(
+            [str(SYSTEMCTL), "is-active", "--quiet", SERVICE],
+            timeout=10,
+            check=False,
+        ).returncode == 0
+        if result.returncode != 0 or not active:
+            raise ManagerError("Mihomo 重启失败。")
+    except Exception as exc:
+        original = config_backup.read_bytes()
+        write_atomic(
+            CONFIG,
+            original,
+            config_stat.st_uid,
+            config_stat.st_gid,
+            stat.S_IMODE(config_stat.st_mode),
+        )
+        if old_state is None:
+            STATE.unlink(missing_ok=True)
+        else:
+            write_atomic(STATE, old_state, 0, 0, 0o600)
+        subprocess.run(
+            [str(SYSTEMCTL), "restart", SERVICE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            check=False,
+        )
+        if isinstance(exc, ManagerError):
+            raise ManagerError(f"{exc} 已自动恢复原配置。") from exc
+        raise ManagerError(f"应用修改失败：{exc}。已自动恢复原配置。") from exc
+
+    return config_backup
+
+
+def command_list(state_data: dict, names_only: bool = False) -> None:
+    entries = state_data.get("subscriptions") or []
+    if names_only:
+        for entry in entries:
+            print(entry["label"])
+        return
+    existing_group = state_data.get("existing_group") or state_data.get("target_group") or "尚未确定"
+    entry_group = state_data.get("entry_group") or "代理选择"
+    print(f"订阅总入口：{entry_group}")
+    print(f"  1. {existing_group}")
+    if not entries:
+        print("新增订阅：无")
+        return
+    for index, entry in enumerate(entries, 1):
+        print(f"  {index + 1}. {entry['label']}")
+
+
+def command_add(label: str, old_text: str, state_data: dict, old_state: bytes | None) -> None:
+    label = validate_label(label)
+    if any(entry["label"].casefold() == label.casefold() for entry in state_data["subscriptions"]):
+        raise ManagerError("已经存在同名订阅。")
+    raw = sys.stdin.read(8193)
+    url = validate_url(raw)
+    entry = {"id": subscription_id(label), "label": label, "url": url}
+    if any(item["id"] == entry["id"] for item in state_data["subscriptions"]):
+        raise ManagerError("订阅标识发生冲突，请换一个名称。")
+
+    state_data["subscriptions"].append(entry)
+    backup = apply_change(old_text, old_state, state_data)
+    print(f"订阅已添加：{label}")
+    print(f"独立策略组：{label}")
+    print(f"订阅总入口：{state_data['entry_group']}")
+    print(f"安全备份：{backup}")
+
+
+def command_remove(label: str, old_text: str, state_data: dict, old_state: bytes | None) -> None:
+    label = validate_label(label)
+    matches = [entry for entry in state_data["subscriptions"] if entry["label"] == label]
+    if len(matches) != 1:
+        raise ManagerError("没有找到该订阅。")
+    removed = matches[0]
+    state_data["subscriptions"] = [
+        entry for entry in state_data["subscriptions"] if entry["label"] != label
+    ]
+    backup = apply_change(old_text, old_state, state_data)
+
+    cache = CONFIG.parent / "proxy_providers" / f"{removed['id']}.yaml"
+    try:
+        cache.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"警告：无法删除 provider 缓存：{exc}", file=sys.stderr)
+
+    print(f"订阅已删除：{label}")
+    print(f"安全备份：{backup}")
+
+
+def command_migrate(old_text: str, state_data: dict, old_state: bytes | None) -> None:
+    backup = apply_change(old_text, old_state, state_data)
+    print("订阅策略组已迁移为独立平级结构。")
+    print(f"订阅总入口：{state_data['entry_group']}")
+    print(f"安全备份：{backup}")
+
+
+def main() -> int:
+    require_root()
+    if not CONFIG.is_file() or not MIHOMO.is_file():
+        fail("找不到 Mihomo 配置或程序文件。")
+    if len(sys.argv) < 2 or sys.argv[1] not in {"add", "remove", "list", "names", "migrate"}:
+        fail("用法：mihomo-subscription-manager add|remove|list|names|migrate [订阅名称]", 2)
+
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        old_text = CONFIG.read_text(encoding="utf-8")
+        old_state = STATE.read_bytes() if STATE.exists() else None
+        state_data = load_state(old_text)
+
+        command = sys.argv[1]
+        if command in {"list", "names"}:
+            if command == "list" and not (
+                state_data.get("existing_group") or state_data.get("target_group")
+            ):
+                state_data["existing_group"] = choose_target_group(
+                    load_yaml(strip_provider_block(old_text))
+                )
+            if command == "list":
+                state_data.setdefault("entry_group", "代理选择")
+            command_list(state_data, names_only=command == "names")
+            return 0
+        if command == "migrate":
+            if len(sys.argv) != 2:
+                fail("migrate 不接受额外参数。", 2)
+            command_migrate(old_text, state_data, old_state)
+            return 0
+        if len(sys.argv) != 3:
+            fail("add/remove 必须提供订阅名称。", 2)
+        if command == "add":
+            command_add(sys.argv[2], old_text, state_data, old_state)
+        else:
+            command_remove(sys.argv[2], old_text, state_data, old_state)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ManagerError as exc:
+        fail(str(exc))
