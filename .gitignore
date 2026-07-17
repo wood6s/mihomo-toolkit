@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Never commit live Mihomo data or credentials.
+config/config.yaml
+config/*.local.yaml
+config/private/
+secrets/
+.managed-subscriptions.json
+proxy_providers/
+subscription-backups/
+*.subscription.yaml
+*.subscription.yml
+.env

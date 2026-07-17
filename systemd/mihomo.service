@@ -1,0 +1,19 @@
+[Unit]
+Description=Mihomo Proxy Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mihomo
+Group=mihomo
+WorkingDirectory=/etc/mihomo
+Environment=HOME=/etc/mihomo
+ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

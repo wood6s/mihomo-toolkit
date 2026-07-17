@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+API="${MIHOMO_API:-http://127.0.0.1:9090}"
+ENTRY_GROUP="${MIHOMO_ENTRY_GROUP:-代理选择}"
+BASE_GROUP="${MIHOMO_BASE_GROUP:-默认代理}"
+SERVICE="${MIHOMO_SERVICE:-mihomo.service}"
+
+uri_encode() {
+    jq -nr --arg value "$1" '$value | @uri'
+}
+
+get_proxy() {
+    local name="$1"
+    local encoded
+    encoded="$(uri_encode "$name")"
+    curl -fsS "$API/proxies/$encoded"
+}
+
+set_proxy() {
+    local group="$1"
+    local selected="$2"
+    local encoded payload
+    encoded="$(uri_encode "$group")"
+    payload="$(jq -nc --arg name "$selected" '{name: $name}')"
+    curl -fsS \
+        -X PUT \
+        -H 'Content-Type: application/json' \
+        -d "$payload" \
+        "$API/proxies/$encoded" \
+        -o /dev/null
+}
+
+choose_item() {
+    local prompt="$1"
+    shift
+    local -a items=("$@")
+    local selected
+
+    if (( ${#items[@]} == 0 )); then
+        echo "没有可选项目。" >&2
+        return 1
+    fi
+
+    echo "$prompt" >&2
+    PS3="输入序号："
+    select selected in "${items[@]}"; do
+        if [[ -n "${selected:-}" ]]; then
+            printf '%s\n' "$selected"
+            return 0
+        fi
+        echo "序号无效，请重新输入。" >&2
+    done
+}
+
+if ! systemctl is-active --quiet "$SERVICE"; then
+    echo "Mihomo 尚未启动，请先运行：proxy_on"
+    exit 1
+fi
+
+if ! ENTRY_JSON="$(get_proxy "$ENTRY_GROUP")"; then
+    ENTRY_GROUP="$BASE_GROUP"
+    if ! ENTRY_JSON="$(get_proxy "$ENTRY_GROUP")"; then
+        echo "无法访问订阅入口：$ENTRY_GROUP"
+        exit 1
+    fi
+fi
+
+if [[ "$(jq -r '.type // ""' <<<"$ENTRY_JSON")" != "Selector" ]]; then
+    echo "订阅入口不是 Selector：$ENTRY_GROUP"
+    exit 1
+fi
+
+CURRENT_SUBSCRIPTION="$(jq -r '.now // "未知"' <<<"$ENTRY_JSON")"
+mapfile -t SUBSCRIPTIONS < <(jq -r '.all[]' <<<"$ENTRY_JSON")
+
+echo "当前订阅：$CURRENT_SUBSCRIPTION"
+SELECTED_SUBSCRIPTION="$(
+    choose_item "请选择订阅：" "${SUBSCRIPTIONS[@]}"
+)"
+
+set_proxy "$ENTRY_GROUP" "$SELECTED_SUBSCRIPTION"
+
+if ! SUBSCRIPTION_JSON="$(get_proxy "$SELECTED_SUBSCRIPTION")"; then
+    echo "已切换到订阅 $SELECTED_SUBSCRIPTION，但无法读取其策略组。"
+    exit 1
+fi
+
+SUBSCRIPTION_TYPE="$(jq -r '.type // ""' <<<"$SUBSCRIPTION_JSON")"
+if [[ "$SUBSCRIPTION_TYPE" != "Selector" ]]; then
+    echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION"
+    exit 0
+fi
+
+CURRENT_NODE="$(jq -r '.now // "未知"' <<<"$SUBSCRIPTION_JSON")"
+mapfile -t NODES < <(jq -r '.all[]' <<<"$SUBSCRIPTION_JSON")
+
+echo
+echo "订阅：$SELECTED_SUBSCRIPTION"
+echo "当前节点：$CURRENT_NODE"
+SELECTED_NODE="$(
+    choose_item "请选择节点：" "${NODES[@]}"
+)"
+
+set_proxy "$SELECTED_SUBSCRIPTION" "$SELECTED_NODE"
+
+NEW_NODE="$(get_proxy "$SELECTED_SUBSCRIPTION" | jq -r '.now // "未知"')"
+
+echo
+echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION → $NEW_NODE"
