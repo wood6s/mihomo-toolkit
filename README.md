@@ -1,17 +1,6 @@
 # mihomo-toolkit
 
-把一台 Debian 主机上的 Mihomo 服务、Zsh 代理命令、交互式节点选择和安全订阅管理整理成可复用项目。
-
-仓库来自一套实际运行的本机配置，但**不包含**节点服务器、UUID、密码、订阅 URL、provider 缓存或完整的个人路由规则。项目即使是私有仓库，也只提交可公开审查的模板。
-
-## 功能
-
-- 以独立的 `mihomo` 系统用户运行服务，并应用 systemd 加固。
-- `proxy_on` / `proxy_off` 只影响当前终端的代理环境变量。
-- 多终端引用登记和异常退出清理，避免重复启动或遗留计数。
-- `proxy_select` 通过本地 Controller API 选择订阅和节点。
-- `proxy_add` / `proxy_remove` 隐藏读取 HTTPS 订阅 URL，修改前验证配置，失败自动回滚。
-- 安装器保留已有 `/etc/mihomo/config.yaml`，不会覆盖真实配置。
+本项目适用于无GUI环境的服务器代理配置，起到在纯命令行环境替代clash-verge-rev的作用。
 
 ## 前置条件
 
@@ -77,19 +66,6 @@ source ~/.config/mihomo-control.zsh
 | `proxy_help` | 显示简短帮助 |
 
 默认参数可在 `~/.config/mihomo-toolkit/env.zsh` 中覆盖。安装器首次运行时会从 [`config/env.zsh.example`](config/env.zsh.example) 创建该文件。尚未添加受管订阅时，选择命令会自动回退到示例配置中的 `默认代理`；首次 `proxy_add` 后使用总入口 `代理选择`。
-
-## 订阅管理的安全边界
-
-`proxy_add` 先完成 sudo 验证，再通过隐藏输入读取 URL，并经标准输入交给 root 管理器。管理器只接受 HTTPS、不接受 `user:password@host`，在写入前会：
-
-- 对配置加独占锁；
-- 只维护带明确起止标记的区块；
-- 运行 `mihomo -t`；
-- 创建权限为 `0600` 的时间戳备份；
-- 原子替换配置并重启服务；
-- 重启失败时恢复配置和状态。
-
-订阅 URL 最终存在 root 管理的 Mihomo 配置、状态与备份中，因此这些文件仍须视为密钥材料。详见 [`docs/security.md`](docs/security.md)。
 
 ## 验证
 
