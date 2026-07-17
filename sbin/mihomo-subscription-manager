@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
@@ -28,13 +29,16 @@ BACKUP_DIR = Path(
 LOCK = Path(os.environ.get("MIHOMO_LOCK", "/run/lock/mihomo-subscriptions.lock"))
 MIHOMO = Path(os.environ.get("MIHOMO_BIN", "/usr/local/bin/mihomo"))
 SYSTEMCTL = Path(os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl"))
+RUNUSER = Path(os.environ.get("RUNUSER_BIN", "/usr/sbin/runuser"))
 SERVICE = os.environ.get("MIHOMO_SERVICE", "mihomo.service")
+SERVICE_USER = os.environ.get("MIHOMO_SERVICE_USER", "mihomo")
 
 ID_PREFIX = "managed_sub_"
 BEGIN_PROVIDERS = "# BEGIN MIHOMO MANAGED SUBSCRIPTIONS"
 END_PROVIDERS = "# END MIHOMO MANAGED SUBSCRIPTIONS"
 BEGIN_GROUPS = "# BEGIN MIHOMO MANAGED SUBSCRIPTION GROUPS"
 END_GROUPS = "# END MIHOMO MANAGED SUBSCRIPTION GROUPS"
+RULE_TRAILING_MODIFIERS = frozenset({"no-resolve"})
 
 
 class ManagerError(RuntimeError):
@@ -239,10 +243,17 @@ def rewrite_rule_targets(text: str, old_target: str, new_target: str) -> tuple[s
             continue
         if not isinstance(rule, str) or "," not in rule:
             continue
-        prefix, policy = rule.rsplit(",", 1)
-        if policy.strip() != old_target:
+        parts = rule.split(",")
+        policy_index = len(parts) - 1
+        while (
+            policy_index > 1
+            and parts[policy_index].strip().casefold() in RULE_TRAILING_MODIFIERS
+        ):
+            policy_index -= 1
+        if parts[policy_index].strip() != old_target:
             continue
-        rewritten = f"{prefix},{new_target}"
+        parts[policy_index] = new_target
+        rewritten = ",".join(parts)
         newline = "\n" if line.endswith("\n") else ""
         lines[i] = f"{match.group(1)}- {json.dumps(rewritten, ensure_ascii=False)}{newline}"
         changed += 1
@@ -443,7 +454,7 @@ def write_atomic(path: Path, content: bytes, uid: int, gid: int, mode: int) -> N
         temp_path.unlink(missing_ok=True)
 
 
-def test_config(content: str, config_stat: os.stat_result, secrets: list[str]) -> None:
+def test_config(content: str, secrets: list[str]) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=".config-test-", suffix=".yaml", dir=CONFIG.parent)
     temp_path = Path(temp_name)
     try:
@@ -451,10 +462,27 @@ def test_config(content: str, config_stat: os.stat_result, secrets: list[str]) -
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chown(temp_path, config_stat.st_uid, config_stat.st_gid)
-        os.chmod(temp_path, stat.S_IMODE(config_stat.st_mode))
+        try:
+            service_account = pwd.getpwnam(SERVICE_USER)
+        except KeyError as exc:
+            raise ManagerError(f"找不到 Mihomo 服务用户：{SERVICE_USER}") from exc
+        if not RUNUSER.is_file():
+            raise ManagerError(f"找不到 runuser：{RUNUSER}")
+        os.chown(temp_path, service_account.pw_uid, service_account.pw_gid)
+        os.chmod(temp_path, 0o600)
         result = subprocess.run(
-            [str(MIHOMO), "-t", "-d", str(CONFIG.parent), "-f", str(temp_path)],
+            [
+                str(RUNUSER),
+                "--user",
+                SERVICE_USER,
+                "--",
+                str(MIHOMO),
+                "-t",
+                "-d",
+                str(CONFIG.parent),
+                "-f",
+                str(temp_path),
+            ],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -500,7 +528,7 @@ def apply_change(old_text: str, old_state: bytes | None, state_data: dict) -> Pa
     config_stat = CONFIG.stat()
     new_text = render_config(old_text, state_data)
     secrets = [entry["url"] for entry in state_data.get("subscriptions") or []]
-    test_config(new_text, config_stat, secrets)
+    test_config(new_text, secrets)
     config_backup, _ = backup_current()
 
     try:
