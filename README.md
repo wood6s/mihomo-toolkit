@@ -97,7 +97,7 @@ source ~/.config/mihomo-control.zsh
 make check
 ```
 
-检查包括 Bash/Zsh/Python 语法、订阅管理器单元测试、示例 YAML 解析和敏感信息启发式扫描。如果本机已安装 ShellCheck，`make check` 会自动运行它。
+检查包括 Bash/Zsh/Python 语法、订阅管理器单元测试、示例 YAML 解析和敏感信息启发式扫描。如果本机已安装 ShellCheck，`make check` 会自动运行它；GitHub Actions 会安装 ShellCheck 并执行相同检查。
 
 ## 项目结构
 
