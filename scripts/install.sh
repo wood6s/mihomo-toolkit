@@ -53,6 +53,10 @@ else
         die "现有配置无法由 mihomo 用户读取；请先检查所有权和权限。"
     echo "保留现有配置：/etc/mihomo/config.yaml"
 fi
+runuser -u mihomo -- test -x /etc/mihomo || \
+    die "mihomo 用户无法进入 /etc/mihomo；请先检查目录权限。"
+runuser -u mihomo -- test -w /etc/mihomo || \
+    die "mihomo 用户无法写入 /etc/mihomo；provider 和缓存将无法更新。"
 
 install -D -m 0644 "$REPO_ROOT/systemd/mihomo.service" \
     /etc/systemd/system/mihomo.service
@@ -97,7 +101,7 @@ chmod 0600 "$SUDOERS_TEMP"
 visudo -cf "$SUDOERS_TEMP" >/dev/null
 install -m 0440 "$SUDOERS_TEMP" "$SUDOERS_FILE"
 
-/usr/local/bin/mihomo -t -d /etc/mihomo
+runuser -u mihomo -- /usr/local/bin/mihomo -t -d /etc/mihomo
 systemctl daemon-reload
 systemctl enable --now mihomo.service
 

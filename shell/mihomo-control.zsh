@@ -2,8 +2,9 @@ typeset _mihomo_env_file="${XDG_CONFIG_HOME:-$HOME/.config}/mihomo-toolkit/env.z
 [[ -r "$_mihomo_env_file" ]] && source "$_mihomo_env_file"
 unset _mihomo_env_file
 
-typeset -g _MIHOMO_PROXY_ACTIVE=0
-typeset -g _MIHOMO_PROXY_CLEANING=0
+# 重复 source 时保留当前终端已经登记的代理状态。
+typeset -g _MIHOMO_PROXY_ACTIVE="${_MIHOMO_PROXY_ACTIVE:-0}"
+typeset -g _MIHOMO_PROXY_CLEANING="${_MIHOMO_PROXY_CLEANING:-0}"
 
 # 可在 source 本文件前覆盖这些值。
 typeset -g MIHOMO_HTTP_PROXY="${MIHOMO_HTTP_PROXY:-http://127.0.0.1:7890}"

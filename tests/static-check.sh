@@ -12,6 +12,13 @@ bash -n bin/mihomo-select
 bash -n scripts/install.sh
 bash -n scripts/uninstall.sh
 zsh -n shell/mihomo-control.zsh
+zsh -fc '
+    source shell/mihomo-control.zsh
+    typeset -g _MIHOMO_PROXY_ACTIVE=1
+    typeset -g _MIHOMO_PROXY_CLEANING=1
+    source shell/mihomo-control.zsh
+    (( _MIHOMO_PROXY_ACTIVE == 1 && _MIHOMO_PROXY_CLEANING == 1 ))
+'
 PYTHONPYCACHEPREFIX="$TEMP_DIR" python3 -m py_compile \
     sbin/mihomo-subscription-manager \
     tests/test_subscription_manager.py
