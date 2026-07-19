@@ -102,6 +102,10 @@ def load_state(config_text: str) -> dict:
 
     if data.get("version") != 1 or not isinstance(data.get("subscriptions"), list):
         raise ManagerError("订阅状态文件格式不受支持。")
+    if "include_existing_group" in data and not isinstance(
+        data["include_existing_group"], bool
+    ):
+        raise ManagerError("订阅状态文件中的默认入口状态无效。")
     return data
 
 
@@ -265,6 +269,7 @@ def rewrite_group_layout(
     existing_group: str,
     entry_group: str,
     entries: list[dict],
+    include_existing_group: bool,
 ) -> str:
     text = strip_group_block(text)
     data = load_yaml(text)
@@ -318,8 +323,11 @@ def rewrite_group_layout(
     if not pg_match:
         raise ManagerError("找不到 proxy-groups 配置段。")
 
+    entry_proxies = ([existing_group] if include_existing_group else []) + labels
+    if not entry_proxies:
+        entry_proxies = ["DIRECT"]
     managed_groups = [
-        {"name": entry_group, "type": "select", "proxies": [existing_group] + labels}
+        {"name": entry_group, "type": "select", "proxies": entry_proxies}
     ]
     managed_groups.extend(
         {"name": entry["label"], "type": "select", "use": [entry["id"]]}
@@ -380,9 +388,16 @@ def render_config(original: str, state: dict) -> str:
     )
     entry_group = state.get("entry_group") or "代理选择"
     entries = state.get("subscriptions") or []
+    include_existing_group = state.get("include_existing_group", True)
     provider_ids = [entry["id"] for entry in entries]
 
-    base = rewrite_group_layout(base, existing_group, entry_group, entries)
+    base = rewrite_group_layout(
+        base,
+        existing_group,
+        entry_group,
+        entries,
+        include_existing_group,
+    )
     if entries:
         match = re.search(r"(?m)^proxy-groups:\s*(?:#.*)?$", base)
         if not match:
@@ -402,7 +417,12 @@ def render_config(original: str, state: dict) -> str:
     ]
     if len(entry_groups) != 1:
         raise ManagerError("生成配置中的订阅总入口校验失败。")
-    expected_groups = [existing_group] + [entry["label"] for entry in entries]
+    expected_groups = (
+        ([existing_group] if include_existing_group else [])
+        + [entry["label"] for entry in entries]
+    )
+    if not expected_groups:
+        expected_groups = ["DIRECT"]
     if entry_groups[0].get("type") != "select" or entry_groups[0].get("proxies") != expected_groups:
         raise ManagerError("总入口策略组结构校验失败。")
     existing_groups = [
@@ -430,6 +450,7 @@ def render_config(original: str, state: dict) -> str:
 
     state["existing_group"] = existing_group
     state["entry_group"] = entry_group
+    state["include_existing_group"] = include_existing_group
     state.pop("target_group", None)
     return base
 
@@ -584,19 +605,27 @@ def apply_change(old_text: str, old_state: bytes | None, state_data: dict) -> Pa
 
 def command_list(state_data: dict, names_only: bool = False) -> None:
     entries = state_data.get("subscriptions") or []
+    existing_group = (
+        state_data.get("existing_group")
+        or state_data.get("target_group")
+        or "尚未确定"
+    )
+    include_existing_group = state_data.get("include_existing_group", True)
+    labels = (
+        ([existing_group] if include_existing_group else [])
+        + [entry["label"] for entry in entries]
+    )
     if names_only:
-        for entry in entries:
-            print(entry["label"])
+        for label in labels:
+            print(label)
         return
-    existing_group = state_data.get("existing_group") or state_data.get("target_group") or "尚未确定"
     entry_group = state_data.get("entry_group") or "代理选择"
     print(f"订阅总入口：{entry_group}")
-    print(f"  1. {existing_group}")
-    if not entries:
-        print("新增订阅：无")
+    if not labels:
+        print("代理入口：无（使用 DIRECT）")
         return
-    for index, entry in enumerate(entries, 1):
-        print(f"  {index + 1}. {entry['label']}")
+    for index, label in enumerate(labels, 1):
+        print(f"  {index}. {label}")
 
 
 def command_add(label: str, old_text: str, state_data: dict, old_state: bytes | None) -> None:
@@ -619,6 +648,18 @@ def command_add(label: str, old_text: str, state_data: dict, old_state: bytes | 
 
 def command_remove(label: str, old_text: str, state_data: dict, old_state: bytes | None) -> None:
     label = validate_label(label)
+    existing_group = state_data.get("existing_group") or state_data.get("target_group")
+    include_existing_group = state_data.get("include_existing_group", True)
+    if label == existing_group and include_existing_group:
+        state_data["include_existing_group"] = False
+        backup = apply_change(old_text, old_state, state_data)
+        print(f"入口已从订阅总入口移除：{label}")
+        print("原始策略组和节点配置已保留。")
+        if not state_data["subscriptions"]:
+            print("当前没有代理入口，总入口已回退到 DIRECT。")
+        print(f"安全备份：{backup}")
+        return
+
     matches = [entry for entry in state_data["subscriptions"] if entry["label"] == label]
     if len(matches) != 1:
         raise ManagerError("没有找到该订阅。")
@@ -635,6 +676,8 @@ def command_remove(label: str, old_text: str, state_data: dict, old_state: bytes
         print(f"警告：无法删除 provider 缓存：{exc}", file=sys.stderr)
 
     print(f"订阅已删除：{label}")
+    if not include_existing_group and not state_data["subscriptions"]:
+        print("当前没有代理入口，总入口已回退到 DIRECT。")
     print(f"安全备份：{backup}")
 
 
@@ -660,17 +703,20 @@ def main() -> int:
         state_data = load_state(old_text)
 
         command = sys.argv[1]
-        if command in {"list", "names"}:
-            if command == "list" and not (
+        if command in {"list", "names", "remove"}:
+            if not (
                 state_data.get("existing_group") or state_data.get("target_group")
             ):
                 state_data["existing_group"] = choose_target_group(
                     load_yaml(strip_provider_block(old_text))
                 )
-            if command == "list":
-                state_data.setdefault("entry_group", "代理选择")
-            command_list(state_data, names_only=command == "names")
-            return 0
+            if command in {"list", "names"}:
+                if command == "list":
+                    state_data.setdefault("entry_group", "代理选择")
+                command_list(state_data, names_only=command == "names")
+                return 0
+            if command == "remove" and len(sys.argv) != 3:
+                fail("add/remove 必须提供订阅名称。", 2)
         if command == "migrate":
             if len(sys.argv) != 2:
                 fail("migrate 不接受额外参数。", 2)

@@ -67,6 +67,8 @@ source ~/.config/mihomo-control.zsh
 
 默认参数可在 `~/.config/mihomo-toolkit/env.zsh` 中覆盖。安装器首次运行时会从 [`config/env.zsh.example`](config/env.zsh.example) 创建该文件。尚未添加受管订阅时，选择命令会自动回退到示例配置中的 `默认代理`；首次 `proxy_add` 后使用总入口 `代理选择`。
 
+`proxy_remove` 会列出总入口中的所有代理选项，包括 `默认代理`。移除默认入口只会把它从总入口中隐藏，不会删除用户原有的策略组或节点配置。如果移除后没有任何代理入口，总入口会回退到 Mihomo 内置的 `DIRECT`，不会重新加入已移除的默认入口。
+
 ## 验证
 
 ```bash

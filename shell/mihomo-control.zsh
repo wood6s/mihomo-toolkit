@@ -211,7 +211,8 @@ proxy_add() {
 proxy_remove() {
     emulate -L zsh
     local -a subscriptions
-    local selected names_output
+    local selected selection names_output
+    local -i index selection_index
     local manager="$MIHOMO_MANAGER"
 
     [[ -x "$manager" ]] || {
@@ -228,8 +229,18 @@ proxy_remove() {
 
     echo "请选择要删除的订阅："
     PS3="输入订阅序号："
-    select selected in "${subscriptions[@]}"; do
-        [[ -n "$selected" ]] && break
+    for (( index = 1; index <= ${#subscriptions}; index++ )); do
+        print -r -- "$index) ${subscriptions[index]}"
+    done
+    while true; do
+        read "selection?$PS3" || return 1
+        if [[ "$selection" == <-> ]]; then
+            selection_index="$selection"
+            if (( selection_index >= 1 && selection_index <= ${#subscriptions} )); then
+                selected="${subscriptions[selection_index]}"
+                break
+            fi
+        fi
         echo "序号无效，请重新输入。"
     done
 

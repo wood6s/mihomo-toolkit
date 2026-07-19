@@ -19,6 +19,29 @@ zsh -fc '
     source shell/mihomo-control.zsh
     (( _MIHOMO_PROXY_ACTIVE == 1 && _MIHOMO_PROXY_CLEANING == 1 ))
 '
+menu_output="$(
+    printf '1\nYES\n' | zsh -fc '
+        sudo() {
+            [[ "$1" == "-v" ]] && return 0
+            [[ "$1" == "-n" ]] && shift
+            case "$2" in
+                names)
+                    print -r -- "默认代理"
+                    print -r -- "bw-month"
+                    ;;
+                remove)
+                    print -r -- "removed:$3"
+                    ;;
+            esac
+        }
+        source shell/mihomo-control.zsh
+        MIHOMO_MANAGER=/bin/true
+        proxy_remove
+    ' 2>&1
+)"
+[[ "$(grep -Fxc '1) 默认代理' <<<"$menu_output")" -eq 1 ]]
+[[ "$(grep -Fxc '2) bw-month' <<<"$menu_output")" -eq 1 ]]
+grep -Fq 'removed:默认代理' <<<"$menu_output"
 PYTHONPYCACHEPREFIX="$TEMP_DIR" python3 -m py_compile \
     sbin/mihomo-subscription-manager \
     tests/test_subscription_manager.py
