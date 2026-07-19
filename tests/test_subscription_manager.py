@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -58,6 +60,7 @@ class SubscriptionManagerTests(unittest.TestCase):
         self.assertIn(manager.BEGIN_GROUPS, rendered)
         self.assertEqual(state["existing_group"], "默认代理")
         self.assertEqual(state["entry_group"], "代理选择")
+        self.assertTrue(state["include_existing_group"])
         self.assertEqual(
             list(parsed["proxy-providers"]), [manager.subscription_id(label)]
         )
@@ -67,6 +70,154 @@ class SubscriptionManagerTests(unittest.TestCase):
             group for group in parsed["proxy-groups"] if group["name"] == "代理选择"
         )
         self.assertEqual(entry["proxies"], ["默认代理", label])
+
+    def test_render_can_remove_existing_group_from_entry(self) -> None:
+        original = (REPO_ROOT / "config" / "config.example.yaml").read_text(
+            encoding="utf-8"
+        )
+        label = "示例订阅"
+        state = {
+            "version": 1,
+            "target_group": "",
+            "include_existing_group": False,
+            "subscriptions": [
+                {
+                    "id": manager.subscription_id(label),
+                    "label": label,
+                    "url": "https://example.com/subscription",
+                }
+            ],
+        }
+
+        rendered = manager.render_config(original, state)
+        parsed = yaml.safe_load(rendered)
+        entry = next(
+            group for group in parsed["proxy-groups"] if group["name"] == "代理选择"
+        )
+
+        self.assertEqual(entry["proxies"], [label])
+        self.assertIn(
+            "默认代理",
+            [group["name"] for group in parsed["proxy-groups"]],
+        )
+
+    def test_render_uses_direct_when_all_proxy_entries_are_removed(self) -> None:
+        original = (REPO_ROOT / "config" / "config.example.yaml").read_text(
+            encoding="utf-8"
+        )
+        state = {
+            "version": 1,
+            "target_group": "",
+            "include_existing_group": False,
+            "subscriptions": [],
+        }
+
+        rendered = manager.render_config(original, state)
+        parsed = yaml.safe_load(rendered)
+        entry = next(
+            group for group in parsed["proxy-groups"] if group["name"] == "代理选择"
+        )
+
+        self.assertEqual(entry["proxies"], ["DIRECT"])
+        self.assertFalse(state["include_existing_group"])
+
+    def test_names_include_removable_existing_group(self) -> None:
+        state = {
+            "version": 1,
+            "existing_group": "默认代理",
+            "subscriptions": [
+                {
+                    "id": manager.subscription_id("示例订阅"),
+                    "label": "示例订阅",
+                    "url": "https://example.com/subscription",
+                }
+            ],
+        }
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            manager.command_list(state, names_only=True)
+
+        self.assertEqual(output.getvalue().splitlines(), ["默认代理", "示例订阅"])
+
+    def test_state_rejects_invalid_existing_group_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                '{"version": 1, "subscriptions": [], '
+                '"include_existing_group": "false"}',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(manager, "STATE", state_path),
+                self.assertRaisesRegex(manager.ManagerError, "默认入口状态无效"),
+            ):
+                manager.load_state("")
+
+    def test_remove_existing_group_keeps_original_config(self) -> None:
+        state = {
+            "version": 1,
+            "existing_group": "默认代理",
+            "subscriptions": [
+                {
+                    "id": manager.subscription_id("示例订阅"),
+                    "label": "示例订阅",
+                    "url": "https://example.com/subscription",
+                }
+            ],
+        }
+        backup = Path("/tmp/config.backup")
+
+        with (
+            mock.patch.object(manager, "apply_change", return_value=backup) as apply,
+            redirect_stdout(io.StringIO()),
+        ):
+            manager.command_remove("默认代理", "original", state, None)
+
+        self.assertFalse(state["include_existing_group"])
+        apply.assert_called_once_with("original", None, state)
+
+    def test_remove_allows_last_existing_group(self) -> None:
+        state = {
+            "version": 1,
+            "existing_group": "默认代理",
+            "subscriptions": [],
+        }
+        backup = Path("/tmp/config.backup")
+
+        with (
+            mock.patch.object(manager, "apply_change", return_value=backup),
+            redirect_stdout(io.StringIO()),
+        ):
+            manager.command_remove("默认代理", "original", state, None)
+
+        self.assertFalse(state["include_existing_group"])
+
+    def test_remove_last_subscription_keeps_existing_group_removed(self) -> None:
+        label = "示例订阅"
+        state = {
+            "version": 1,
+            "existing_group": "默认代理",
+            "include_existing_group": False,
+            "subscriptions": [
+                {
+                    "id": manager.subscription_id(label),
+                    "label": label,
+                    "url": "https://example.com/subscription",
+                }
+            ],
+        }
+        backup = Path("/tmp/config.backup")
+
+        with (
+            mock.patch.object(manager, "apply_change", return_value=backup),
+            mock.patch.object(Path, "unlink"),
+            redirect_stdout(io.StringIO()),
+        ):
+            manager.command_remove(label, "original", state, None)
+
+        self.assertEqual(state["subscriptions"], [])
+        self.assertFalse(state["include_existing_group"])
 
     def test_rewrite_rule_targets_preserves_trailing_modifiers(self) -> None:
         original = """rules:
