@@ -109,6 +109,45 @@ proxy_off() {
     fi
 }
 
+proxy_check() {
+    local url="${1:-https://www.gstatic.com/generate_204}"
+
+    if (( _MIHOMO_PROXY_ACTIVE != 1 )); then
+        echo "当前终端代理未开启，请先执行 proxy_on。"
+        return 1
+    fi
+
+    echo "Mihomo 服务：$(systemctl is-active "$MIHOMO_SERVICE" 2>/dev/null || true)"
+    echo "HTTPS_PROXY=${HTTPS_PROXY:-未设置}"
+    echo "测试地址：$url"
+
+    local result
+    result="$(
+        curl --connect-timeout 5 \
+             --max-time 10 \
+             -sS \
+             -o /dev/null \
+             -w 'HTTP=%{http_code} remote=%{remote_ip}:%{remote_port} time=%{time_total}s' \
+             "$url"
+    )"
+    local curl_status=$?
+
+    if (( curl_status != 0 )); then
+        echo "代理测试：失败"
+        return $curl_status
+    fi
+
+    echo "$result"
+
+    if [[ "$result" == HTTP=204* ]]; then
+        echo "代理测试：正常"
+        return 0
+    fi
+
+    echo "代理测试：异常"
+    return 1
+}
+
 proxy_select() {
     MIHOMO_API="$MIHOMO_API" \
         MIHOMO_ENTRY_GROUP="$MIHOMO_ENTRY_GROUP" \
@@ -293,6 +332,7 @@ proxy_help() {
     cat <<'HELP'
 proxy_on      为当前终端开启代理，必要时启动 Mihomo
 proxy_off     关闭当前终端代理，不停止常驻的 Mihomo 服务
+proxy_check   测试当前终端代理的 HTTPS 连通性
 proxy_select  选择 Mihomo 策略组和代理节点
 proxy_add     隐藏输入并添加 HTTPS 订阅
 proxy_remove  交互选择并删除已添加的订阅

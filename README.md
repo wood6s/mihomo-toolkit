@@ -56,6 +56,7 @@ source ~/.config/mihomo-control.zsh
 | --- | --- |
 | `proxy_on` | 启动服务并为当前终端设置 HTTP/HTTPS/SOCKS 代理 |
 | `proxy_off` | 清除当前终端的代理变量并释放登记 |
+| `proxy_check [URL]` | 测试当前终端代理的 HTTPS 连通性，默认请求 gstatic 204 地址 |
 | `proxy_select` | 交互选择订阅与节点 |
 | `proxy_add` | 隐藏输入并添加 HTTPS 订阅 |
 | `proxy_remove` | 删除由工具管理的订阅 |
