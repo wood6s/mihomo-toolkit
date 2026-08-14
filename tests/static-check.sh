@@ -19,6 +19,77 @@ zsh -fc '
     source shell/mihomo-control.zsh
     (( _MIHOMO_PROXY_ACTIVE == 1 && _MIHOMO_PROXY_CLEANING == 1 ))
 '
+inactive_check_output="$(
+    zsh -fc '
+        curl() {
+            return 99
+        }
+        source shell/mihomo-control.zsh
+        proxy_check
+    ' 2>&1
+)" && {
+    echo "proxy_check 在代理未开启时意外成功。" >&2
+    exit 1
+}
+grep -Fq '当前终端代理未开启，请先执行 proxy_on。' <<<"$inactive_check_output"
+
+successful_check_output="$(
+    zsh -fc '
+        systemctl() {
+            print -r -- active
+        }
+        curl() {
+            [[ "$*" == *"--connect-timeout 5"* ]] || return 90
+            [[ "$*" == *"--max-time 10"* ]] || return 91
+            [[ "${argv[-1]}" == "https://www.gstatic.com/generate_204" ]] || return 92
+            print -r -- "HTTP=204 remote=127.0.0.1:7890 time=0.010000s"
+        }
+        source shell/mihomo-control.zsh
+        typeset -g _MIHOMO_PROXY_ACTIVE=1
+        HTTPS_PROXY=http://127.0.0.1:7890
+        proxy_check
+    ' 2>&1
+)"
+grep -Fq 'Mihomo 服务：active' <<<"$successful_check_output"
+grep -Fq '测试地址：https://www.gstatic.com/generate_204' <<<"$successful_check_output"
+grep -Fq 'HTTP=204 remote=127.0.0.1:7890 time=0.010000s' <<<"$successful_check_output"
+grep -Fq '代理测试：正常' <<<"$successful_check_output"
+
+failed_check_output="$(
+    zsh -fc '
+        systemctl() {
+            print -r -- active
+        }
+        curl() {
+            return 28
+        }
+        source shell/mihomo-control.zsh
+        typeset -g _MIHOMO_PROXY_ACTIVE=1
+        proxy_check https://example.com/health
+    ' 2>&1
+)" || failed_check_status=$?
+[[ "${failed_check_status:-0}" -eq 28 ]]
+grep -Fq '测试地址：https://example.com/health' <<<"$failed_check_output"
+grep -Fq '代理测试：失败' <<<"$failed_check_output"
+
+unexpected_check_output="$(
+    zsh -fc '
+        systemctl() {
+            print -r -- active
+        }
+        curl() {
+            print -r -- "HTTP=200 remote=127.0.0.1:7890 time=0.010000s"
+        }
+        source shell/mihomo-control.zsh
+        typeset -g _MIHOMO_PROXY_ACTIVE=1
+        proxy_check https://example.com/health
+    ' 2>&1
+)" && {
+    echo "proxy_check 在 HTTP 状态非 204 时意外成功。" >&2
+    exit 1
+}
+grep -Fq '代理测试：异常' <<<"$unexpected_check_output"
+
 menu_output="$(
     printf '1\nYES\n' | zsh -fc '
         sudo() {
