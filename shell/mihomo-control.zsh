@@ -9,12 +9,15 @@ typeset -g _MIHOMO_PROXY_CLEANING="${_MIHOMO_PROXY_CLEANING:-0}"
 # 可在 source 本文件前覆盖这些值。
 typeset -g MIHOMO_HTTP_PROXY="${MIHOMO_HTTP_PROXY:-http://127.0.0.1:7890}"
 typeset -g MIHOMO_SOCKS_PROXY="${MIHOMO_SOCKS_PROXY:-socks5h://127.0.0.1:7890}"
+typeset -g MIHOMO_NO_PROXY="${MIHOMO_NO_PROXY:-localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
 typeset -g MIHOMO_API="${MIHOMO_API:-http://127.0.0.1:9090}"
 typeset -g MIHOMO_ENTRY_GROUP="${MIHOMO_ENTRY_GROUP:-代理选择}"
 typeset -g MIHOMO_BASE_GROUP="${MIHOMO_BASE_GROUP:-默认代理}"
 typeset -g MIHOMO_SERVICE="${MIHOMO_SERVICE:-mihomo.service}"
 typeset -g MIHOMO_REF="${MIHOMO_REF:-$HOME/.local/bin/mihomo-ref}"
 typeset -g MIHOMO_SELECT="${MIHOMO_SELECT:-$HOME/.local/bin/mihomo-select}"
+typeset -g MIHOMO_GLOBAL="${MIHOMO_GLOBAL:-$HOME/.local/bin/mihomo-global-proxy}"
+typeset -g MIHOMO_MODE="${MIHOMO_MODE:-$HOME/.local/bin/mihomo-mode}"
 typeset -g MIHOMO_MANAGER="${MIHOMO_MANAGER:-/usr/local/sbin/mihomo-subscription-manager}"
 
 _mihomo_clear_environment() {
@@ -64,7 +67,7 @@ proxy_on() {
     export https_proxy="$HTTPS_PROXY"
     export all_proxy="$ALL_PROXY"
 
-    export NO_PROXY="localhost,127.0.0.1,::1"
+    export NO_PROXY="$MIHOMO_NO_PROXY"
     export no_proxy="$NO_PROXY"
 
     typeset -g _MIHOMO_PROXY_ACTIVE=1
@@ -153,7 +156,15 @@ proxy_select() {
         MIHOMO_ENTRY_GROUP="$MIHOMO_ENTRY_GROUP" \
         MIHOMO_BASE_GROUP="$MIHOMO_BASE_GROUP" \
         MIHOMO_SERVICE="$MIHOMO_SERVICE" \
+        MIHOMO_MODE="$MIHOMO_MODE" \
         "$MIHOMO_SELECT"
+}
+
+proxy_mode() {
+    MIHOMO_API="$MIHOMO_API" \
+        MIHOMO_ENTRY_GROUP="$MIHOMO_ENTRY_GROUP" \
+        MIHOMO_BASE_GROUP="$MIHOMO_BASE_GROUP" \
+        "$MIHOMO_MODE" "$@"
 }
 
 proxy_gc() {
@@ -311,8 +322,10 @@ proxy_status() {
     service_state="$(systemctl is-active "$MIHOMO_SERVICE" 2>/dev/null || true)"
     echo "Mihomo 服务：$service_state"
     echo "登记使用的终端数：$user_count"
+    proxy_global_status
 
     if [[ "$service_state" == "active" ]]; then
+        proxy_mode
         _mihomo_show_selection
     fi
 
@@ -324,16 +337,43 @@ proxy_status() {
     fi
 }
 
+_mihomo_global() {
+    MIHOMO_HTTP_PROXY="$MIHOMO_HTTP_PROXY" \
+        MIHOMO_SOCKS_PROXY="$MIHOMO_SOCKS_PROXY" \
+        MIHOMO_NO_PROXY="$MIHOMO_NO_PROXY" \
+        MIHOMO_SERVICE="$MIHOMO_SERVICE" \
+        "$MIHOMO_GLOBAL" "$@"
+}
+
+proxy_global_on() {
+    _mihomo_global on || return $?
+    source "${XDG_CONFIG_HOME:-$HOME/.config}/mihomo-toolkit/proxy-defaults.sh"
+    proxy_on
+}
+
+proxy_global_off() {
+    _mihomo_global off || return $?
+    proxy_off
+}
+
+proxy_global_status() {
+    _mihomo_global status
+}
+
 # zsh 正常退出、关闭终端或 SSH 会话结束时自动释放
 autoload -Uz add-zsh-hook
 add-zsh-hook -d zshexit _mihomo_proxy_exit_cleanup 2>/dev/null || true
 add-zsh-hook zshexit _mihomo_proxy_exit_cleanup
 proxy_help() {
     cat <<'HELP'
+proxy_global_on      开启桌面系统代理及默认代理，重启后保留，同时开启当前终端
+proxy_global_off     关闭桌面系统代理及默认代理，重启后保留，同时关闭当前终端
+proxy_global_status  查看默认代理与桌面系统代理设置
 proxy_on      为当前终端开启代理，必要时启动 Mihomo
 proxy_off     关闭当前终端代理，不停止常驻的 Mihomo 服务
 proxy_check   测试当前终端代理的 HTTPS 连通性
 proxy_select  选择 Mihomo 策略组和代理节点
+proxy_mode [rule|global|direct]  查看或切换运行模式，GLOBAL 跟随 proxy_select
 proxy_add     隐藏输入并添加 HTTPS 订阅
 proxy_remove  交互选择并删除已添加的订阅
 proxy_list    列出已添加的订阅（不显示地址）
@@ -343,3 +383,15 @@ proxy_gc      清理异常退出终端留下的记录
 proxy_help    显示本帮助信息
 HELP
 }
+
+# 首次加载时应用持久化偏好，重复 source 保留当前终端的独立开关。
+if [[ "${_MIHOMO_DEFAULTS_LOADED:-0}" != 1 ]]; then
+    typeset _mihomo_defaults_file="${XDG_CONFIG_HOME:-$HOME/.config}/mihomo-toolkit/proxy-defaults.sh"
+    [[ -r "$_mihomo_defaults_file" ]] && source "$_mihomo_defaults_file"
+    unset _mihomo_defaults_file
+    typeset -g _MIHOMO_DEFAULTS_LOADED=1
+    if [[ "${https_proxy:-}" == "$MIHOMO_HTTP_PROXY" ]]; then
+        typeset -g _MIHOMO_PROXY_ACTIVE=1
+        "$MIHOMO_REF" acquire "${ZSH_PID:-$$}" >/dev/null 2>&1 || true
+    fi
+fi

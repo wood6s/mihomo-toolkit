@@ -1,0 +1,205 @@
+#!/usr/bin/python3
+"""Persist this user's desktop and shell proxy preference."""
+
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+DEFAULTS = CONFIG / "mihomo-toolkit/proxy-defaults.sh"
+ENVIRONMENT = CONFIG / "environment.d/90-mihomo-proxy.conf"
+SERVICE = os.environ.get("MIHOMO_SERVICE", "mihomo.service")
+HTTP = os.environ.get("MIHOMO_HTTP_PROXY", "http://127.0.0.1:7890")
+SOCKS = os.environ.get("MIHOMO_SOCKS_PROXY", "socks5h://127.0.0.1:7890")
+BYPASS = os.environ.get("MIHOMO_NO_PROXY", "localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12").split(",")
+VALUES = {
+    "http_proxy": HTTP,
+    "https_proxy": HTTP,
+    "all_proxy": SOCKS,
+    "no_proxy": ",".join(BYPASS),
+}
+VALUES.update({key.upper(): value for key, value in list(VALUES.items())})
+
+
+def run(*args, check=True):
+    environment = os.environ.copy()
+    runtime = Path(f"/run/user/{os.getuid()}")
+    if runtime.is_dir():
+        environment.setdefault("XDG_RUNTIME_DIR", str(runtime))
+    if (runtime / "bus").exists():
+        environment.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime}/bus")
+    return subprocess.run(args, text=True, capture_output=True, check=check, timeout=20,
+                          env=environment)
+
+
+def desktop_command():
+    if not shutil.which("gsettings"):
+        return None
+    schemas = run("gsettings", "list-schemas", check=False)
+    if schemas.returncode or "org.gnome.system.proxy" not in schemas.stdout.splitlines():
+        return None
+    if (not os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+            and not Path(f"/run/user/{os.getuid()}/bus").exists()):
+        if not shutil.which("dbus-run-session"):
+            raise RuntimeError("缺少桌面会话总线；请安装 dbus-run-session 或在用户登录后执行。")
+        return ("dbus-run-session", "--", "gsettings")
+    return ("gsettings",)
+
+
+def endpoint(url, schemes):
+    parsed = urlsplit(url)
+    if (parsed.scheme not in schemes or not parsed.hostname or not parsed.port
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("代理地址须为无认证的协议://主机:端口。")
+    return parsed.hostname, parsed.port
+
+
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def preference():
+    if not DEFAULTS.exists():
+        return "未设置"
+    return "已开启" if "# MIHOMO_GLOBAL_PROXY=on\n" in DEFAULTS.read_text() else "已关闭"
+
+
+def status():
+    print(f"默认代理：{preference()}")
+    command = desktop_command()
+    if command is None:
+        print("桌面系统代理：未安装 GNOME 代理设置，仅使用终端和用户服务配置")
+        return
+    mode = run(*command, "get", "org.gnome.system.proxy", "mode").stdout.strip()
+    print(f"桌面系统代理：{mode}")
+    if mode == "'manual'":
+        for protocol in ("http", "https", "socks"):
+            schema = f"org.gnome.system.proxy.{protocol}"
+            host = run(*command, "get", schema, "host").stdout.strip().strip("'")
+            port = run(*command, "get", schema, "port").stdout.strip()
+            print(f"{protocol.upper()}：{host}:{port}")
+
+
+def switch(enabled):
+    if enabled:
+        if any(any(character.isspace() for character in value) for value in VALUES.values()):
+            raise ValueError("代理地址和绕过列表不能包含空白字符。")
+        http_host, http_port = endpoint(HTTP, ("http",))
+        socks_host, socks_port = endpoint(SOCKS, ("socks5", "socks5h"))
+    if enabled and run("systemctl", "is-active", "--quiet", SERVICE, check=False).returncode:
+        run("sudo", "-n", "/usr/bin/systemctl", "start", SERVICE)
+
+    command = desktop_command()
+    settings = []
+    if enabled and command:
+        for protocol in ("http", "https", "ftp", "socks"):
+            schema = f"org.gnome.system.proxy.{protocol}"
+            host, port = (socks_host, socks_port) if protocol == "socks" else (http_host, http_port)
+            settings.extend([(schema, "host", repr(host)), (schema, "port", str(port))])
+        settings.extend([
+            ("org.gnome.system.proxy.http", "enabled", "true"),
+            ("org.gnome.system.proxy.http", "use-authentication", "false"),
+            ("org.gnome.system.proxy", "use-same-proxy", "false"),
+            ("org.gnome.system.proxy", "ignore-hosts", repr(BYPASS)),
+        ])
+    if command:
+        settings.append(("org.gnome.system.proxy", "mode", "'manual'" if enabled else "'none'"))
+
+    # Capture exactly the settings and files this operation changes for rollback.
+    old_settings = [(schema, key, run(*command, "get", schema, key).stdout.strip())
+                    for schema, key, value in settings]
+    old_files = {path: path.read_text() if path.exists() else None
+                 for path in (DEFAULTS, ENVIRONMENT)}
+    old_environment = {}
+    manager = run("systemctl", "--user", "show-environment", check=False)
+    for line in manager.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in VALUES:
+            old_environment[key] = value
+    sync_command = ("dbus-update-activation-environment", "--systemd") if shutil.which(
+        "dbus-update-activation-environment") else ("systemctl", "--user", "set-environment")
+
+    state = "on" if enabled else "off"
+    header = f"# Managed by mihomo-global-proxy.\n# MIHOMO_GLOBAL_PROXY={state}\n"
+    shell = header
+    if enabled:
+        shell += "".join(f"export {key}={shlex.quote(value)}\n" for key, value in VALUES.items())
+    else:
+        shell += "unset " + " ".join(VALUES) + "\n"
+    environment = header + "".join(f"{key}={value if enabled else ''}\n" for key, value in VALUES.items())
+
+    try:
+        for schema, key, value in settings:
+            run(*command, "set", schema, key, value)
+            actual = run(*command, "get", schema, key).stdout.strip()
+            if actual != value:
+                raise RuntimeError(f"桌面代理写入未生效：{schema} {key}")
+        write_atomic(DEFAULTS, shell)
+        write_atomic(ENVIRONMENT, environment)
+        if manager.returncode == 0:
+            run(*sync_command,
+                *(f"{key}={value if enabled else ''}" for key, value in VALUES.items()))
+    except Exception:
+        for path, text in old_files.items():
+            if text is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_atomic(path, text)
+        for schema, key, value in reversed(old_settings):
+            run(*command, "set", schema, key, value, check=False)
+        if manager.returncode == 0:
+            run(*sync_command,
+                *(f"{key}={old_environment.get(key, '')}" for key in VALUES), check=False)
+            missing = VALUES.keys() - old_environment.keys()
+            if missing:
+                run("systemctl", "--user", "unset-environment", *sorted(missing), check=False)
+        raise
+
+    scope = "系统代理及新终端默认代理" if command else "新终端及用户服务默认代理"
+    print(f"{scope}已{'开启' if enabled else '关闭'}，重启后保留。")
+    if manager.returncode:
+        print("当前没有可用的 systemd 用户会话；用户服务将在下次登录时读取配置。")
+    print("已运行的应用可能需要重启；其他已打开的终端可执行 proxy_on / proxy_off。")
+
+
+def main():
+    if sys.argv[1:] == ["--version"]:
+        candidates = (Path(__file__).resolve().parents[1] / "VERSION", CONFIG / "mihomo-toolkit/VERSION")
+        for path in candidates:
+            if path.is_file():
+                print(f"mihomo-toolkit {path.read_text().strip()}")
+                return 0
+        print("mihomo-toolkit（尚无正式版本，当前为待测试的工作区）")
+        return 0
+    if len(sys.argv) != 2 or sys.argv[1] not in ("on", "off", "status"):
+        print("用法：mihomo-global-proxy on|off|status|--version", file=sys.stderr)
+        return 2
+    try:
+        if sys.argv[1] == "status":
+            status()
+        else:
+            switch(sys.argv[1] == "on")
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        detail = getattr(error, "stderr", None) or str(error)
+        print(f"代理设置失败：{detail.strip()}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

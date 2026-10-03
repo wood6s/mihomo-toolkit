@@ -5,6 +5,8 @@ API="${MIHOMO_API:-http://127.0.0.1:9090}"
 ENTRY_GROUP="${MIHOMO_ENTRY_GROUP:-代理选择}"
 BASE_GROUP="${MIHOMO_BASE_GROUP:-默认代理}"
 SERVICE="${MIHOMO_SERVICE:-mihomo.service}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MODE_TOOL="${MIHOMO_MODE:-$SCRIPT_DIR/mihomo-mode}"
 
 uri_encode() {
     jq -nr --arg value "$1" '$value | @uri'
@@ -14,7 +16,7 @@ get_proxy() {
     local name="$1"
     local encoded
     encoded="$(uri_encode "$name")"
-    curl -fsS "$API/proxies/$encoded"
+    curl --noproxy '*' --connect-timeout 5 --max-time 10 -fsS "$API/proxies/$encoded"
 }
 
 set_proxy() {
@@ -23,7 +25,7 @@ set_proxy() {
     local encoded payload
     encoded="$(uri_encode "$group")"
     payload="$(jq -nc --arg name "$selected" '{name: $name}')"
-    curl -fsS \
+    curl --noproxy '*' --connect-timeout 5 --max-time 10 -fsS \
         -X PUT \
         -H 'Content-Type: application/json' \
         -d "$payload" \
@@ -51,6 +53,7 @@ choose_item() {
         fi
         echo "序号无效，请重新输入。" >&2
     done
+    return 1
 }
 
 if ! systemctl is-active --quiet "$SERVICE"; then
@@ -79,6 +82,17 @@ SELECTED_SUBSCRIPTION="$(
     choose_item "请选择订阅：" "${SUBSCRIPTIONS[@]}"
 )"
 
+# Link the selector itself so every later subscription/node selection also applies to GLOBAL.
+[[ -x "$MODE_TOOL" ]] || {
+    echo "缺少路由模式工具，请重新安装 mihomo-toolkit：$MODE_TOOL" >&2
+    exit 1
+}
+MIHOMO_API="$API" MIHOMO_ENTRY_GROUP="$ENTRY_GROUP" MIHOMO_BASE_GROUP="$BASE_GROUP" \
+    "$MODE_TOOL" --sync-global >/dev/null || {
+        echo "GLOBAL 关联失败，未更改本次节点选择。" >&2
+        exit 1
+    }
+
 set_proxy "$ENTRY_GROUP" "$SELECTED_SUBSCRIPTION"
 
 if ! SUBSCRIPTION_JSON="$(get_proxy "$SELECTED_SUBSCRIPTION")"; then
@@ -88,7 +102,7 @@ fi
 
 SUBSCRIPTION_TYPE="$(jq -r '.type // ""' <<<"$SUBSCRIPTION_JSON")"
 if [[ "$SUBSCRIPTION_TYPE" != "Selector" ]]; then
-    echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION"
+    echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION（GLOBAL 同步跟随）"
     exit 0
 fi
 
@@ -107,4 +121,4 @@ set_proxy "$SELECTED_SUBSCRIPTION" "$SELECTED_NODE"
 NEW_NODE="$(get_proxy "$SELECTED_SUBSCRIPTION" | jq -r '.now // "未知"')"
 
 echo
-echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION → $NEW_NODE"
+echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION → $NEW_NODE（GLOBAL 同步跟随）"
