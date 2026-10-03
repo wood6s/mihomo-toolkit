@@ -73,6 +73,14 @@ runuser -u "$TARGET_USER" -- install -m 0755 \
     "$REPO_ROOT/bin/mihomo-ref" "$TARGET_HOME/.local/bin/mihomo-ref"
 runuser -u "$TARGET_USER" -- install -m 0755 \
     "$REPO_ROOT/bin/mihomo-select" "$TARGET_HOME/.local/bin/mihomo-select"
+runuser -u "$TARGET_USER" -- install -m 0755 \
+    "$REPO_ROOT/bin/mihomo-mode" "$TARGET_HOME/.local/bin/mihomo-mode"
+runuser -u "$TARGET_USER" -- install -m 0755 \
+    "$REPO_ROOT/bin/mihomo-global-proxy" "$TARGET_HOME/.local/bin/mihomo-global-proxy"
+if [[ -f "$REPO_ROOT/VERSION" ]]; then
+    runuser -u "$TARGET_USER" -- install -m 0644 \
+        "$REPO_ROOT/VERSION" "$TARGET_HOME/.config/mihomo-toolkit/VERSION"
+fi
 runuser -u "$TARGET_USER" -- install -m 0600 \
     "$REPO_ROOT/shell/mihomo-control.zsh" "$TARGET_HOME/.config/mihomo-control.zsh"
 if [[ ! -e "$TARGET_HOME/.config/mihomo-toolkit/env.zsh" ]]; then
@@ -92,6 +100,9 @@ source "$HOME/.config/mihomo-control.zsh"
 ZSHRC_BLOCK
 fi
 
+runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" \
+    python3 "$REPO_ROOT/scripts/configure-user.py" install
+
 SUDOERS_FILE="/etc/sudoers.d/mihomo-toolkit-$TARGET_USER"
 SUDOERS_TEMP="$(mktemp)"
 trap 'rm -f -- "$SUDOERS_TEMP"' EXIT
@@ -109,3 +120,6 @@ echo
 echo "安装完成。重新进入 Zsh，或运行："
 echo "  source \"$TARGET_HOME/.config/mihomo-control.zsh\""
 echo "随后可运行：proxy_help"
+runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" \
+    "$TARGET_HOME/.local/bin/mihomo-global-proxy" --version
+echo "配置有效节点后，运行 proxy_global_on 可持久开启默认代理。升级安装保留已有开关状态。"

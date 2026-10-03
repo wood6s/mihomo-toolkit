@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_USER="${MIHOMO_INSTALL_USER:-${SUDO_USER:-}}"
 
 die() {
@@ -14,6 +15,14 @@ die() {
 getent passwd "$TARGET_USER" >/dev/null || die "用户不存在：$TARGET_USER"
 
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+if [[ -x "$TARGET_HOME/.local/bin/mihomo-global-proxy" ]]; then
+    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" \
+        XDG_CONFIG_HOME="$TARGET_HOME/.config" \
+        "$TARGET_HOME/.local/bin/mihomo-global-proxy" off || \
+        die "关闭系统代理失败；服务和工具仍保留，请修复后重试卸载。"
+fi
+runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" \
+    python3 "$REPO_ROOT/scripts/configure-user.py" remove
 systemctl disable --now mihomo.service 2>/dev/null || true
 
 rm -f -- \
@@ -23,6 +32,11 @@ rm -f -- \
     /usr/local/sbin/mihomo-subscription-manager \
     "$TARGET_HOME/.local/bin/mihomo-ref" \
     "$TARGET_HOME/.local/bin/mihomo-select" \
+    "$TARGET_HOME/.local/bin/mihomo-mode" \
+    "$TARGET_HOME/.local/bin/mihomo-global-proxy" \
+    "$TARGET_HOME/.config/environment.d/90-mihomo-proxy.conf" \
+    "$TARGET_HOME/.config/mihomo-toolkit/proxy-defaults.sh" \
+    "$TARGET_HOME/.config/mihomo-toolkit/VERSION" \
     "$TARGET_HOME/.config/mihomo-control.zsh"
 rmdir /etc/systemd/system/mihomo.service.d 2>/dev/null || true
 systemctl daemon-reload

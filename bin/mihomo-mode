@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Change Mihomo's runtime mode and make GLOBAL follow the node selector."""
+
+import json
+import os
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import ProxyHandler, Request, build_opener
+
+
+MODES = {"rule": "规则", "global": "全局", "direct": "直连"}
+
+
+class ModeError(Exception):
+    pass
+
+
+class Controller:
+    def __init__(self, api, entry_group, base_group):
+        self.api = api.rstrip("/")
+        self.entry_group = entry_group
+        self.base_group = base_group
+        # Controller requests must also work when application proxy settings are off/broken.
+        self.opener = build_opener(ProxyHandler({}))
+
+    def request(self, method, path, payload=None):
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = Request(self.api + path, data=data, method=method,
+                          headers={"Content-Type": "application/json"})
+        try:
+            with self.opener.open(request, timeout=5) as response:
+                body = response.read()
+            result = json.loads(body) if body else {}
+            if not isinstance(result, dict):
+                raise ModeError("Mihomo 控制接口返回了无效数据。")
+            return result
+        except HTTPError as error:
+            raise ModeError(f"Mihomo 控制接口 {method} {path} 返回 HTTP {error.code}。") from error
+        except (URLError, OSError, TimeoutError) as error:
+            raise ModeError("无法连接 Mihomo 控制接口，请检查服务及 MIHOMO_API。") from error
+        except (ValueError, UnicodeError) as error:
+            raise ModeError("Mihomo 控制接口返回的 JSON 无效。") from error
+
+    def proxies(self):
+        proxies = self.request("GET", "/proxies").get("proxies")
+        if not isinstance(proxies, dict):
+            raise ModeError("无法读取 Mihomo 策略组。")
+        return proxies
+
+    @staticmethod
+    def selection_path(proxies, start):
+        path = []
+        current = start
+        while current:
+            if current in path:
+                raise ModeError("策略组存在循环引用，无法确定出口。")
+            path.append(current)
+            proxy = proxies.get(current)
+            if not isinstance(proxy, dict):
+                raise ModeError(f"无法读取选择路径中的策略组或节点：{current}")
+            selected = proxy.get("now")
+            if selected and selected not in proxies:
+                # Provider nodes appear in the group's all/now fields, but are absent
+                # from GET /proxies and cannot necessarily be queried individually.
+                if selected not in proxy.get("all", []):
+                    raise ModeError(f"策略组 {current} 的当前出口不在可选列表中。")
+                path.append(selected)
+                break
+            current = selected
+        return path
+
+    def global_target(self, proxies):
+        entry = self.entry_group if self.entry_group in proxies else self.base_group
+        group = proxies.get(entry, {})
+        if group.get("type") != "Selector":
+            raise ModeError(f"找不到 proxy_select 使用的 Selector 入口：{entry}")
+        global_group = proxies.get("GLOBAL", {})
+        if global_group.get("type") != "Selector" or entry not in global_group.get("all", []):
+            raise ModeError(f"GLOBAL 无法选择入口 {entry}，未修改路由模式。")
+        path = self.selection_path(proxies, entry)
+        if "GLOBAL" in path:
+            raise ModeError("所选入口引用了 GLOBAL，不能建立循环关联。")
+        if len(path) < 2:
+            raise ModeError(f"入口 {entry} 尚未选择出口，请先运行 proxy_select。")
+        return entry
+
+    def set_global(self, target):
+        self.request("PUT", "/proxies/" + quote("GLOBAL", safe=""), {"name": target})
+        if self.proxies().get("GLOBAL", {}).get("now") != target:
+            raise ModeError("GLOBAL 出口切换未生效。")
+
+    def set_mode(self, mode):
+        self.request("PATCH", "/configs", {"mode": mode})
+        if self.request("GET", "/configs").get("mode") != mode:
+            raise ModeError("路由模式切换未生效。")
+
+    def change(self, mode=None):
+        """mode=None only links GLOBAL; each mutating request is verified."""
+        previous_mode = self.request("GET", "/configs").get("mode")
+        if previous_mode not in MODES:
+            raise ModeError("无法识别当前路由模式，未执行切换。")
+        previous_global = None
+        target = None
+        if mode in (None, "global"):
+            proxies = self.proxies()
+            target = self.global_target(proxies)
+            previous_global = proxies["GLOBAL"].get("now")
+            if not isinstance(previous_global, str) or not previous_global:
+                raise ModeError("无法读取 GLOBAL 原出口，未执行切换。")
+
+        attempted_global = False
+        attempted_mode = False
+        try:
+            if target is not None and previous_global != target:
+                attempted_global = True
+                self.set_global(target)
+            if mode is not None and previous_mode != mode:
+                attempted_mode = True
+                self.set_mode(mode)
+        except ModeError as error:
+            failed = []
+            # Restore the mode before restoring a possibly DIRECT GLOBAL outlet.
+            if attempted_mode:
+                try:
+                    self.set_mode(previous_mode)
+                except ModeError:
+                    failed.append("路由模式")
+            if attempted_global:
+                try:
+                    self.set_global(previous_global)
+                except ModeError:
+                    failed.append("GLOBAL 出口")
+            if failed:
+                raise ModeError(f"{error} 恢复失败：{'、'.join(failed)}；请执行 proxy_mode 检查。") from error
+            raise ModeError(f"{error} 已恢复原状态。") from error
+
+    def status(self):
+        mode = self.request("GET", "/configs").get("mode", "未知")
+        print(f"Mihomo 路由模式：{mode}（{MODES.get(mode, '未知')}）")
+        proxies = self.proxies()
+        if "GLOBAL" in proxies:
+            print("GLOBAL 出口：" + " → ".join(self.selection_path(proxies, "GLOBAL")))
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments in (["-h"], ["--help"]):
+        print("用法：mihomo-mode [rule|global|direct]\n不带参数查看状态；切换仅作用于当前运行配置。")
+        return 0
+    if len(arguments) > 1 or (arguments and arguments[0] not in (*MODES, "--sync-global")):
+        print("用法：mihomo-mode [rule|global|direct]", file=sys.stderr)
+        return 2
+    controller = Controller(os.environ.get("MIHOMO_API", "http://127.0.0.1:9090"),
+                            os.environ.get("MIHOMO_ENTRY_GROUP", "代理选择"),
+                            os.environ.get("MIHOMO_BASE_GROUP", "默认代理"))
+    try:
+        if arguments:
+            controller.change(None if arguments[0] == "--sync-global" else arguments[0])
+            if arguments[0] == "--sync-global":
+                print("GLOBAL 已跟随 proxy_select 的选择入口。")
+            else:
+                print("运行模式已更新；重启或重载配置后按配置文件中的 mode 生效。")
+        controller.status()
+    except ModeError as error:
+        print(f"代理模式操作失败：{error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
