@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -117,13 +118,21 @@ def strip_provider_block(text: str) -> str:
     if not has_begin:
         return text
 
+    # Legacy blocks own the top-level key; mixed blocks own only indented entries.
     pattern = re.compile(
-        rf"(?ms)^{re.escape(BEGIN_PROVIDERS)}\n.*?^{re.escape(END_PROVIDERS)}\n?"
+        rf"(?ms)^(?P<indent>[ \t]*){re.escape(BEGIN_PROVIDERS)}\n"
+        rf".*?^(?P=indent){re.escape(END_PROVIDERS)}(?:\n|\Z)"
     )
     matches = list(pattern.finditer(text))
-    if len(matches) != 1:
+    if (len(matches) != 1 or text.count(BEGIN_PROVIDERS) != 1
+            or text.count(END_PROVIDERS) != 1):
         raise ManagerError("受管配置区块数量异常。")
-    return pattern.sub("", text, count=1)
+    match = matches[0]
+    end = match.end()
+    # The legacy renderer adds one separating blank line after its root block.
+    if not match.group("indent") and text[end:end + 1] == "\n":
+        end += 1
+    return text[:match.start()] + text[end:]
 
 
 def strip_group_block(text: str) -> str:
@@ -143,11 +152,35 @@ def strip_group_block(text: str) -> str:
     return pattern.sub("", text, count=1)
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Reject ambiguous explicit keys while retaining normal YAML merge overrides."""
+
+
+def unique_mapping(loader, node, deep=False):
+    seen = set()
+    for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            if key in seen:
+                raise ManagerError("配置中存在重复的 YAML 字段；为避免覆盖，已停止操作。")
+            seen.add(key)
+        except TypeError:
+            raise ManagerError("配置中存在不支持的 YAML 映射键。") from None
+    loader.flatten_mapping(node)
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+
+UniqueKeyLoader.add_constructor("tag:yaml.org,2002:map", unique_mapping)
+
+
 def load_yaml(text: str) -> dict:
     try:
-        data = yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
-        raise ManagerError(f"当前 Mihomo 配置不是有效 YAML：{exc}") from exc
+        data = yaml.load(text, Loader=UniqueKeyLoader) or {}
+    except yaml.YAMLError:
+        # Parser diagnostics may contain subscription URLs or node credentials.
+        raise ManagerError("当前 Mihomo 配置不是有效 YAML；详细内容已隐藏。") from None
     if not isinstance(data, dict):
         raise ManagerError("Mihomo 配置顶层必须是映射。")
     return data
@@ -270,6 +303,7 @@ def rewrite_group_layout(
     entry_group: str,
     entries: list[dict],
     include_existing_group: bool,
+    managed_provider_ids: set[str],
 ) -> str:
     text = strip_group_block(text)
     data = load_yaml(text)
@@ -286,7 +320,7 @@ def rewrite_group_layout(
         existing_use = subscription_group.get("use") or []
         if not isinstance(existing_use, list) or not all(isinstance(v, str) for v in existing_use):
             raise ManagerError(f"策略组 {existing_group!r} 的 use 字段格式异常。")
-        unmanaged_use = [value for value in existing_use if not value.startswith(ID_PREFIX)]
+        unmanaged_use = [value for value in existing_use if value not in managed_provider_ids]
         if unmanaged_use:
             subscription_group["use"] = unmanaged_use
         else:
@@ -371,15 +405,164 @@ def provider_block(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_config(original: str, state: dict) -> str:
+def insert_provider_entries(text: str, entries: list[dict]) -> str:
+    """Insert only our marked children, preserving external providers and comments.
+
+    AST locations avoid guessing mapping boundaries. Flow mappings retain their
+    original text, anchors and aliases; their added children use flow syntax too.
+    """
+    document = yaml.compose(text, Loader=yaml.SafeLoader)
+    nodes = [(key, value) for key, value in document.value
+             if key.value == "proxy-providers"]
+    if not nodes:
+        match = re.search(r"(?m)^proxy-groups:\s*(?:#.*)?$", text)
+        if not match:
+            raise ManagerError("找不到 proxy-groups 插入位置。")
+        return text[:match.start()] + provider_block(entries) + "\n\n" + text[match.start():]
+    key, value = nodes[0]
+    if value.start_mark.index < key.end_mark.index:
+        raise ManagerError("proxy-providers 使用了外部 YAML 别名；请先展开该映射再添加订阅。")
+    providers = load_yaml(provider_block(entries))["proxy-providers"]
+    if isinstance(value, yaml.MappingNode) and value.flow_style:
+        opening = value.start_mark.index
+        if text[opening:opening + 1] != "{":
+            raise ManagerError("proxy-providers 的流式映射带有标签或锚点；请先改为块式映射。")
+        at = opening + 1
+        if text[at:at + 1] == "\n":
+            at += 1
+            prefix = text[:at]
+        else:
+            prefix = text[:at] + "\n"
+        lines = ["  " + BEGIN_PROVIDERS]
+        lines += ["  " + dump_flow({name: spec})[1:-1] + ","
+                  for name, spec in providers.items()]
+        lines.append("  " + END_PROVIDERS)
+        return prefix + "\n".join(lines) + "\n" + text[at:]
+    if isinstance(value, yaml.MappingNode) and value.value:
+        first = value.value[0][0].start_mark
+        if first.line == key.start_mark.line:
+            raise ManagerError("proxy-providers 的映射布局不受支持。")
+        at = first.index - first.column
+        indent = " " * first.column
+    elif isinstance(value, yaml.ScalarNode) and value.tag == "tag:yaml.org,2002:null":
+        if value.start_mark.line != key.start_mark.line:
+            raise ManagerError("proxy-providers 的空值布局不受支持。")
+        text = text[:value.start_mark.index] + text[value.end_mark.index:]
+        at = text.find("\n", key.end_mark.index)
+        if at < 0:
+            text += "\n"
+            at = len(text) - 1
+        at += 1
+        indent = "  "
+    else:
+        raise ManagerError("proxy-providers 必须是映射或空值。")
+    body = yaml.safe_dump(providers, allow_unicode=True, sort_keys=False)
+    block = indent + BEGIN_PROVIDERS + "\n" + textwrap.indent(body, indent)
+    block += indent + END_PROVIDERS + "\n"
+    return text[:at] + block + text[at:]
+
+
+def replace_yaml_section(text: str, name: str, replacement: str) -> str:
+    """Replace one root section; the caller must verify the full parsed document."""
+    document = yaml.compose(text, Loader=yaml.SafeLoader)
+    sections = [(key, value) for key, value in document.value if key.value == name]
+    if len(sections) != 1:
+        raise ManagerError("恢复管理标记时无法唯一确定配置段。")
+    key, value = sections[0]
+    if key.start_mark.column != 0 or value.start_mark.index < key.end_mark.index:
+        raise ManagerError("配置段使用了不支持的布局或外部别名，不能自动恢复管理标记。")
+    return text[:key.start_mark.index] + replacement + text[value.end_mark.index:]
+
+
+def recover_managed_markers(original: str, previous_state: dict) -> str:
+    """Recover ownership only from persisted state plus exact config matches.
+
+    YAML formatters may erase all comments and expand flow groups. Restore the
+    marked sections in memory, leaving the normal validation/backup transaction
+    responsible for saving. Newly requested entries are never ownership evidence.
+    """
+    entries = previous_state.get("subscriptions") or []
+    existing = previous_state.get("existing_group") or previous_state.get("target_group")
+    if not existing:
+        return original
+    # Partial or duplicated markers remain errors, rather than migration signals.
+    strip_provider_block(original)
+    strip_group_block(original)
+    restore_providers = bool(entries) and BEGIN_PROVIDERS not in original
+    restore_groups = BEGIN_GROUPS not in original
+    if not restore_providers and not restore_groups:
+        return original
+    data = load_yaml(original)
+    text = original
+    ids = [entry["id"] for entry in entries]
+    if len(set(ids)) != len(ids) or any(
+        entry["id"] != subscription_id(entry["label"]) for entry in entries
+    ):
+        raise ManagerError("旧订阅状态中的标识不一致，不能自动恢复管理标记。")
+    if restore_providers:
+        providers = data.get("proxy-providers") or {}
+        expected = load_yaml(provider_block(entries))["proxy-providers"]
+        if not isinstance(providers, dict) or any(
+            providers.get(name) != spec for name, spec in expected.items()
+        ):
+            raise ManagerError("旧订阅源与已保存状态不完全匹配，不能自动恢复管理标记。")
+        # Keep every external provider, even when it uses our name prefix.
+        external = {name: spec for name, spec in providers.items() if name not in expected}
+        block = "proxy-providers:\n  " + BEGIN_PROVIDERS + "\n"
+        block += textwrap.indent(yaml.safe_dump(expected, allow_unicode=True, sort_keys=False), "  ")
+        block += "  " + END_PROVIDERS + "\n"
+        if external:
+            block += textwrap.indent(yaml.safe_dump(external, allow_unicode=True, sort_keys=False), "  ")
+        text = replace_yaml_section(text, "proxy-providers", block)
+    if restore_groups:
+        entry_group = previous_state.get("entry_group") or "代理选择"
+        labels = [entry["label"] for entry in entries]
+        selected = ([existing] if previous_state.get("include_existing_group", True) else []) + labels
+        expected_groups = [{"name": entry_group, "type": "select", "proxies": selected or ["DIRECT"]}]
+        expected_groups += [{"name": entry["label"], "type": "select", "use": [entry["id"]]}
+                            for entry in entries]
+        names = {group["name"] for group in expected_groups}
+        groups = data.get("proxy-groups") or []
+        positions = [i for i, group in enumerate(groups)
+                     if isinstance(group, dict) and group.get("name") in names]
+        if (not positions or [groups[i] for i in positions] != expected_groups
+                or positions != list(range(positions[0], positions[0] + len(expected_groups)))):
+            raise ManagerError("旧订阅策略组与已保存状态不完全匹配，不能自动恢复管理标记。")
+        lines = ["proxy-groups:"]
+        for index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                raise ManagerError("策略组格式异常，不能自动恢复管理标记。")
+            if index == positions[0]:
+                lines.append("  " + BEGIN_GROUPS)
+            lines.append("  - " + dump_flow(group))
+            if index == positions[-1]:
+                lines.append("  " + END_GROUPS)
+        text = replace_yaml_section(text, "proxy-groups", "\n".join(lines) + "\n")
+    try:
+        unchanged = load_yaml(text) == data
+    except ManagerError:
+        unchanged = False
+    if not unchanged:
+        raise ManagerError("恢复管理标记会改变配置含义，已停止操作。")
+    return text
+
+
+def render_config(original: str, state: dict, previous_state: dict | None = None) -> str:
+    if previous_state is not None:
+        original = recover_managed_markers(original, previous_state)
+    original_data = load_yaml(original)
     base = strip_provider_block(original)
     config_without_managed_groups = strip_group_block(base)
     data = load_yaml(config_without_managed_groups)
 
-    if "proxy-providers" in data:
-        raise ManagerError(
-            "配置中存在非本工具管理的 proxy-providers；为避免覆盖，已停止操作。"
-        )
+    external_providers = data.get("proxy-providers")
+    if external_providers is None:
+        external_providers = {}
+    if not isinstance(external_providers, dict) or any(
+        not isinstance(name, str) or not name or not isinstance(spec, dict)
+        for name, spec in external_providers.items()
+    ):
+        raise ManagerError("已有 proxy-providers 必须是名称到配置的映射。")
 
     existing_group = (
         state.get("existing_group")
@@ -390,6 +573,17 @@ def render_config(original: str, state: dict) -> str:
     entries = state.get("subscriptions") or []
     include_existing_group = state.get("include_existing_group", True)
     provider_ids = [entry["id"] for entry in entries]
+    if len(set(provider_ids)) != len(provider_ids):
+        raise ManagerError("订阅状态中存在重复的 provider 标识；已停止操作。")
+    if set(provider_ids) & set(external_providers):
+        raise ManagerError("新订阅的 provider 名称与已有订阅源冲突；已停止操作。")
+    prior_managed_ids = set(original_data.get("proxy-providers") or {}) - set(external_providers)
+    managed_paths = {(CONFIG.parent / "proxy_providers" / f"{name}.yaml").resolve()
+                     for name in prior_managed_ids | set(provider_ids)}
+    for provider in external_providers.values():
+        path = provider.get("path")
+        if isinstance(path, str) and path and (CONFIG.parent / path).resolve() in managed_paths:
+            raise ManagerError("新订阅的缓存路径与已有订阅源冲突；已停止操作。")
 
     base = rewrite_group_layout(
         base,
@@ -397,18 +591,17 @@ def render_config(original: str, state: dict) -> str:
         entry_group,
         entries,
         include_existing_group,
+        prior_managed_ids | set(provider_ids),
     )
     if entries:
-        match = re.search(r"(?m)^proxy-groups:\s*(?:#.*)?$", base)
-        if not match:
-            raise ManagerError("找不到 proxy-groups 插入位置。")
-        block = provider_block(entries) + "\n\n"
-        base = base[: match.start()] + block + base[match.start() :]
+        base = insert_provider_entries(base, entries)
 
     rendered = load_yaml(base)
     actual_providers = rendered.get("proxy-providers") or {}
-    if set(actual_providers) != set(provider_ids):
+    if set(actual_providers) != set(provider_ids) | set(external_providers):
         raise ManagerError("生成配置中的 provider 列表校验失败。")
+    if any(actual_providers[name] != spec for name, spec in external_providers.items()):
+        raise ManagerError("已有订阅源在生成配置中发生变化；已停止操作。")
 
     entry_groups = [
         group
@@ -547,7 +740,8 @@ def save_state(state_data: dict) -> None:
 
 def apply_change(old_text: str, old_state: bytes | None, state_data: dict) -> Path:
     config_stat = CONFIG.stat()
-    new_text = render_config(old_text, state_data)
+    previous_state = json.loads(old_state) if old_state is not None else None
+    new_text = render_config(old_text, state_data, previous_state)
     secrets = [entry["url"] for entry in state_data.get("subscriptions") or []]
     test_config(new_text, secrets)
     config_backup, _ = backup_current()
