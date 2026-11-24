@@ -33,6 +33,7 @@ rm -f -- \
     "$TARGET_HOME/.local/bin/mihomo-ref" \
     "$TARGET_HOME/.local/bin/mihomo-select" \
     "$TARGET_HOME/.local/bin/mihomo-mode" \
+    "$TARGET_HOME/.local/bin/mihomo_api.py" \
     "$TARGET_HOME/.local/bin/mihomo-global-proxy" \
     "$TARGET_HOME/.config/environment.d/90-mihomo-proxy.conf" \
     "$TARGET_HOME/.config/mihomo-toolkit/proxy-defaults.sh" \

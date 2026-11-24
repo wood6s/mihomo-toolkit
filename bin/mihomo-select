@@ -1,36 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-API="${MIHOMO_API:-http://127.0.0.1:9090}"
 ENTRY_GROUP="${MIHOMO_ENTRY_GROUP:-代理选择}"
 BASE_GROUP="${MIHOMO_BASE_GROUP:-默认代理}"
 SERVICE="${MIHOMO_SERVICE:-mihomo.service}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODE_TOOL="${MIHOMO_MODE:-$SCRIPT_DIR/mihomo-mode}"
 
-uri_encode() {
-    jq -nr --arg value "$1" '$value | @uri'
-}
-
-get_proxy() {
-    local name="$1"
-    local encoded
-    encoded="$(uri_encode "$name")"
-    curl --noproxy '*' --connect-timeout 5 --max-time 10 -fsS "$API/proxies/$encoded"
-}
-
-set_proxy() {
-    local group="$1"
-    local selected="$2"
-    local encoded payload
-    encoded="$(uri_encode "$group")"
-    payload="$(jq -nc --arg name "$selected" '{name: $name}')"
-    curl --noproxy '*' --connect-timeout 5 --max-time 10 -fsS \
-        -X PUT \
-        -H 'Content-Type: application/json' \
-        -d "$payload" \
-        "$API/proxies/$encoded" \
-        -o /dev/null
+proxy_api() {
+    python3 "$SCRIPT_DIR/mihomo_api.py" "$@"
 }
 
 choose_item() {
@@ -61,13 +39,8 @@ if ! systemctl is-active --quiet "$SERVICE"; then
     exit 1
 fi
 
-if ! ENTRY_JSON="$(get_proxy "$ENTRY_GROUP")"; then
-    ENTRY_GROUP="$BASE_GROUP"
-    if ! ENTRY_JSON="$(get_proxy "$ENTRY_GROUP")"; then
-        echo "无法访问订阅入口：$ENTRY_GROUP"
-        exit 1
-    fi
-fi
+ENTRY_JSON="$(proxy_api get "$ENTRY_GROUP" "$BASE_GROUP")"
+ENTRY_GROUP="$(jq -r '.name' <<<"$ENTRY_JSON")"
 
 if [[ "$(jq -r '.type // ""' <<<"$ENTRY_JSON")" != "Selector" ]]; then
     echo "订阅入口不是 Selector：$ENTRY_GROUP"
@@ -87,15 +60,15 @@ SELECTED_SUBSCRIPTION="$(
     echo "缺少路由模式工具，请重新安装 mihomo-toolkit：$MODE_TOOL" >&2
     exit 1
 }
-MIHOMO_API="$API" MIHOMO_ENTRY_GROUP="$ENTRY_GROUP" MIHOMO_BASE_GROUP="$BASE_GROUP" \
+MIHOMO_API="${MIHOMO_API:-http://127.0.0.1:9090}" MIHOMO_ENTRY_GROUP="$ENTRY_GROUP" MIHOMO_BASE_GROUP="$BASE_GROUP" \
     "$MODE_TOOL" --sync-global >/dev/null || {
         echo "GLOBAL 关联失败，未更改本次节点选择。" >&2
         exit 1
     }
 
-set_proxy "$ENTRY_GROUP" "$SELECTED_SUBSCRIPTION"
+proxy_api set "$ENTRY_GROUP" "$SELECTED_SUBSCRIPTION"
 
-if ! SUBSCRIPTION_JSON="$(get_proxy "$SELECTED_SUBSCRIPTION")"; then
+if ! SUBSCRIPTION_JSON="$(proxy_api get "$SELECTED_SUBSCRIPTION")"; then
     echo "已切换到订阅 $SELECTED_SUBSCRIPTION，但无法读取其策略组。"
     exit 1
 fi
@@ -116,9 +89,9 @@ SELECTED_NODE="$(
     choose_item "请选择节点：" "${NODES[@]}"
 )"
 
-set_proxy "$SELECTED_SUBSCRIPTION" "$SELECTED_NODE"
+proxy_api set "$SELECTED_SUBSCRIPTION" "$SELECTED_NODE"
 
-NEW_NODE="$(get_proxy "$SELECTED_SUBSCRIPTION" | jq -r '.now // "未知"')"
+NEW_NODE="$(proxy_api get "$SELECTED_SUBSCRIPTION" | jq -r '.now // "未知"')"
 
 echo
 echo "切换成功：$ENTRY_GROUP → $SELECTED_SUBSCRIPTION → $NEW_NODE（GLOBAL 同步跟随）"

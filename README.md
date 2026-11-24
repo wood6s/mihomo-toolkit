@@ -126,6 +126,8 @@ proxy_mode direct    # 所有进入 Mihomo 的流量直连
 路由模式通过控制接口即时修改，不改写 `/etc/mihomo/config.yaml`。重启或重载服务后的模式以配置文件中的 `mode` 为准。
 其他 Shell 可通过 `~/.local/bin/mihomo-mode [rule|global|direct]` 使用同一功能；支持 `MIHOMO_API`、`MIHOMO_ENTRY_GROUP`、`MIHOMO_BASE_GROUP` 环境变量。
 
+如果管理端口设置了 `secret`，将同一密钥单独存为一行，并将文件权限设为 `600`。访问默认管理地址 `http://127.0.0.1:9090` 时，`proxy_select`、`proxy_mode` 和 `proxy_status` 会自动读取 `${XDG_CONFIG_HOME:-$HOME/.config}/mihomo/secret`。默认文件缺失时按无密钥配置连接。使用其他管理地址或密钥路径时，在 `env.zsh` 中将 `MIHOMO_SECRET_FILE` 指向对应文件。
+
 ## 验证
 
 ```bash

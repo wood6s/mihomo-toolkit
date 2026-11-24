@@ -153,6 +153,7 @@ proxy_check() {
 
 proxy_select() {
     MIHOMO_API="$MIHOMO_API" \
+        MIHOMO_SECRET_FILE="${MIHOMO_SECRET_FILE:-}" \
         MIHOMO_ENTRY_GROUP="$MIHOMO_ENTRY_GROUP" \
         MIHOMO_BASE_GROUP="$MIHOMO_BASE_GROUP" \
         MIHOMO_SERVICE="$MIHOMO_SERVICE" \
@@ -162,6 +163,7 @@ proxy_select() {
 
 proxy_mode() {
     MIHOMO_API="$MIHOMO_API" \
+        MIHOMO_SECRET_FILE="${MIHOMO_SECRET_FILE:-}" \
         MIHOMO_ENTRY_GROUP="$MIHOMO_ENTRY_GROUP" \
         MIHOMO_BASE_GROUP="$MIHOMO_BASE_GROUP" \
         "$MIHOMO_MODE" "$@"
@@ -184,25 +186,19 @@ proxy_users() {
 }
 
 _mihomo_show_selection() {
-    local api="$MIHOMO_API"
-    local entry_group="$MIHOMO_ENTRY_GROUP"
-    local entry_uri entry_json current_subscription target_uri target_json next_target
+    local -x MIHOMO_API="$MIHOMO_API" MIHOMO_SECRET_FILE="${MIHOMO_SECRET_FILE:-}"
+    local api_client="$HOME/.local/bin/mihomo_api.py"
+    local entry_json current_subscription target_json next_target
     local current_node
     local -a selection_path
     local -i depth
 
-    command -v curl >/dev/null 2>&1 || return 0
     command -v jq >/dev/null 2>&1 || return 0
 
-    entry_uri="$(jq -nr --arg value "$entry_group" '$value | @uri')"
-    entry_json="$(curl -fsS "$api/proxies/$entry_uri" 2>/dev/null)" || {
-        entry_group="$MIHOMO_BASE_GROUP"
-        entry_uri="$(jq -nr --arg value "$entry_group" '$value | @uri')"
-        entry_json="$(curl -fsS "$api/proxies/$entry_uri" 2>/dev/null)" || {
-            echo "当前订阅：无法读取"
-            echo "当前节点：无法读取"
-            return 0
-        }
+    entry_json="$(python3 "$api_client" get "$MIHOMO_ENTRY_GROUP" "$MIHOMO_BASE_GROUP")" || {
+        echo "当前订阅：无法读取"
+        echo "当前节点：无法读取"
+        return 0
     }
 
     current_subscription="$(jq -r '.now // "未知"' <<<"$entry_json")"
@@ -211,8 +207,7 @@ _mihomo_show_selection() {
     current_node="$current_subscription"
     selection_path=("$current_subscription")
     for (( depth = 0; depth < 8; depth++ )); do
-        target_uri="$(jq -nr --arg value "$current_node" '$value | @uri')"
-        target_json="$(curl -fsS "$api/proxies/$target_uri" 2>/dev/null)" || break
+        target_json="$(python3 "$api_client" get "$current_node" 2>/dev/null)" || break
         next_target="$(jq -r '.now // empty' <<<"$target_json")"
         [[ -n "$next_target" && "$next_target" != "$current_node" ]] || break
         current_node="$next_target"
