@@ -1,46 +1,21 @@
 #!/usr/bin/env python3
 """Change Mihomo's runtime mode and make GLOBAL follow the node selector."""
 
-import json
 import os
 import sys
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import ProxyHandler, Request, build_opener
+
+from mihomo_api import DEFAULT_API, ControllerAPI, ControllerError as ModeError
 
 
 MODES = {"rule": "规则", "global": "全局", "direct": "直连"}
 
 
-class ModeError(Exception):
-    pass
-
-
-class Controller:
+class Controller(ControllerAPI):
     def __init__(self, api, entry_group, base_group):
-        self.api = api.rstrip("/")
+        super().__init__(api)
         self.entry_group = entry_group
         self.base_group = base_group
-        # Controller requests must also work when application proxy settings are off/broken.
-        self.opener = build_opener(ProxyHandler({}))
-
-    def request(self, method, path, payload=None):
-        data = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = Request(self.api + path, data=data, method=method,
-                          headers={"Content-Type": "application/json"})
-        try:
-            with self.opener.open(request, timeout=5) as response:
-                body = response.read()
-            result = json.loads(body) if body else {}
-            if not isinstance(result, dict):
-                raise ModeError("Mihomo 控制接口返回了无效数据。")
-            return result
-        except HTTPError as error:
-            raise ModeError(f"Mihomo 控制接口 {method} {path} 返回 HTTP {error.code}。") from error
-        except (URLError, OSError, TimeoutError) as error:
-            raise ModeError("无法连接 Mihomo 控制接口，请检查服务及 MIHOMO_API。") from error
-        except (ValueError, UnicodeError) as error:
-            raise ModeError("Mihomo 控制接口返回的 JSON 无效。") from error
 
     def proxies(self):
         proxies = self.request("GET", "/proxies").get("proxies")
@@ -151,10 +126,10 @@ def main():
     if len(arguments) > 1 or (arguments and arguments[0] not in (*MODES, "--sync-global")):
         print("用法：mihomo-mode [rule|global|direct]", file=sys.stderr)
         return 2
-    controller = Controller(os.environ.get("MIHOMO_API", "http://127.0.0.1:9090"),
-                            os.environ.get("MIHOMO_ENTRY_GROUP", "代理选择"),
-                            os.environ.get("MIHOMO_BASE_GROUP", "默认代理"))
     try:
+        controller = Controller(os.environ.get("MIHOMO_API") or DEFAULT_API,
+                                os.environ.get("MIHOMO_ENTRY_GROUP", "代理选择"),
+                                os.environ.get("MIHOMO_BASE_GROUP", "默认代理"))
         if arguments:
             controller.change(None if arguments[0] == "--sync-global" else arguments[0])
             if arguments[0] == "--sync-global":

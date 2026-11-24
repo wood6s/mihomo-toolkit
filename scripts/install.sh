@@ -71,6 +71,8 @@ runuser -u "$TARGET_USER" -- mkdir -p \
 
 runuser -u "$TARGET_USER" -- install -m 0755 \
     "$REPO_ROOT/bin/mihomo-ref" "$TARGET_HOME/.local/bin/mihomo-ref"
+runuser -u "$TARGET_USER" -- install -m 0644 \
+    "$REPO_ROOT/bin/mihomo_api.py" "$TARGET_HOME/.local/bin/mihomo_api.py"
 runuser -u "$TARGET_USER" -- install -m 0755 \
     "$REPO_ROOT/bin/mihomo-select" "$TARGET_HOME/.local/bin/mihomo-select"
 runuser -u "$TARGET_USER" -- install -m 0755 \

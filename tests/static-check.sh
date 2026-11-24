@@ -10,7 +10,7 @@ trap 'rm -rf -- "$TEMP_DIR"' EXIT
 export XDG_CONFIG_HOME="$TEMP_DIR/config"
 export XDG_RUNTIME_DIR="$TEMP_DIR/runtime"
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
-unset MIHOMO_HTTP_PROXY MIHOMO_SOCKS_PROXY MIHOMO_NO_PROXY MIHOMO_API MIHOMO_REF MIHOMO_MODE
+unset MIHOMO_HTTP_PROXY MIHOMO_SOCKS_PROXY MIHOMO_NO_PROXY MIHOMO_API MIHOMO_SECRET_FILE MIHOMO_REF MIHOMO_MODE
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
 
 bash -n bin/mihomo-ref
@@ -122,6 +122,7 @@ grep -Fq 'removed:默认代理' <<<"$menu_output"
 PYTHONPYCACHEPREFIX="$TEMP_DIR" python3 -m py_compile \
     bin/mihomo-global-proxy \
     bin/mihomo-mode \
+    bin/mihomo_api.py \
     scripts/configure-user.py \
     sbin/mihomo-subscription-manager \
     tests/test_global_proxy.py \

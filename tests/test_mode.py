@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -16,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 LOADER = SourceFileLoader("mihomo_mode", str(ROOT / "bin/mihomo-mode"))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 mode = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(mode)
+with mock.patch.object(sys, "path", [str(ROOT / "bin"), *sys.path]):
+    SPEC.loader.exec_module(mode)
 
 
 def proxy_fixture():
@@ -71,6 +73,31 @@ class FakeController(mode.Controller):
 class ModeTests(unittest.TestCase):
     def setUp(self):
         self.controller = FakeController()
+
+    def test_default_secret_is_optional_and_scoped_to_the_local_api(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+                os.environ, {"XDG_CONFIG_HOME": directory, "MIHOMO_SECRET_FILE": ""}):
+            self.assertIsNone(mode.ControllerAPI(mode.DEFAULT_API).secret)
+            secret = Path(directory) / "mihomo/secret"
+            secret.parent.mkdir()
+            secret.write_text("default-test-key\n")
+            self.assertEqual(mode.ControllerAPI(mode.DEFAULT_API + "/").secret, "default-test-key")
+            self.assertIsNone(mode.ControllerAPI("http://controller.invalid").secret)
+
+    def test_mode_requests_authenticate_reads_and_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secret = Path(directory) / "secret"
+            secret.write_text("mode-test-key\n")
+            with mock.patch.dict(os.environ, {"MIHOMO_SECRET_FILE": str(secret)}):
+                controller = mode.Controller("https://controller.invalid", "entry", "base")
+            with mock.patch.object(controller.opener, "open", side_effect=lambda *a, **kw: io.BytesIO()) as send:
+                for method, path, payload in [("GET", "/configs", None),
+                                              ("PATCH", "/configs", {"mode": "global"}),
+                                              ("PUT", "/proxies/GLOBAL", {"name": "entry"})]:
+                    controller.request(method, path, payload)
+                    request = send.call_args.args[0]
+                    self.assertEqual(request.get_header("Authorization"), "Bearer mode-test-key")
+                    self.assertNotIn("Authorization", request.headers)
 
     def test_global_links_entry_before_mode_change_and_preserves_selected_node(self):
         original_entry = copy.deepcopy(self.controller.groups["代理选择"])
@@ -198,25 +225,40 @@ class SelectorIntegrationTests(unittest.TestCase):
         self.state.write_text(json.dumps({"proxies": proxy_fixture(), "events": []}))
         scripts = {
             "systemctl": "#!/bin/sh\nexit 0\n",
-            "curl": '''#!/usr/bin/env python3
-import json, os, sys
+            "sitecustomize.py": '''import io, json, os
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import unquote
-p = Path(os.environ['SELECTOR_TEST_STATE'])
-state = json.loads(p.read_text())
-args = sys.argv[1:]
-assert '--noproxy' in args and args[args.index('--noproxy') + 1] == '*'
-url = next(value for value in args if value.startswith('http://'))
-name = unquote(url.rsplit('/', 1)[-1])
-if '-X' in args:
-    payload = json.loads(args[args.index('-d') + 1])
-    state['proxies'][name]['now'] = payload['name']
-    state['events'].append(['select', name, payload['name']])
-    p.write_text(json.dumps(state))
-elif name not in state['proxies']:
-    sys.exit(22)
-else:
-    print(json.dumps(state['proxies'][name]))
+import urllib.request
+
+class TestOpener:
+    def open(self, request, timeout):
+        path = Path(os.environ['SELECTOR_TEST_STATE'])
+        state = json.loads(path.read_text())
+        name = unquote(request.selector.rsplit('/', 1)[-1])
+        status = 200
+        result = {}
+        if request.unredirected_hdrs.get('Authorization') != 'Bearer test-controller-key':
+            status = 401
+        elif request.get_method() == 'PUT':
+            payload = json.loads(request.data)
+            state['proxies'][name]['now'] = payload['name']
+            state['events'].append(['select', name, payload['name']])
+        elif name not in state['proxies']:
+            status = 404
+        else:
+            result = state['proxies'][name]
+        state.setdefault('requests', []).append([request.get_method(), name, status])
+        path.write_text(json.dumps(state))
+        if status != 200:
+            raise HTTPError(request.full_url, status, 'test error', {}, None)
+        return io.BytesIO(json.dumps(result).encode())
+
+def build_opener(handler):
+    assert handler.proxies == {}
+    return TestOpener()
+
+urllib.request.build_opener = build_opener
 ''',
             "mode-helper": '''#!/usr/bin/env python3
 import json, os, sys
@@ -237,9 +279,12 @@ p.write_text(json.dumps(state))
             path = self.directory / name
             path.write_text(content)
             path.chmod(0o755)
+        self.secret_file = self.directory / "secret"
+        self.secret_file.write_text("test-controller-key\n")
         self.environment = {**os.environ, "PATH": str(self.directory) + os.pathsep + os.environ["PATH"],
                             "MIHOMO_API": "http://controller.invalid", "MIHOMO_ENTRY_GROUP": "代理选择",
                             "MIHOMO_BASE_GROUP": "默认代理", "MIHOMO_MODE": str(self.directory / "mode-helper"),
+                            "MIHOMO_SECRET_FILE": str(self.secret_file), "PYTHONPATH": str(self.directory),
                             "SELECTOR_TEST_STATE": str(self.state)}
 
     def select(self, choices):
@@ -255,6 +300,25 @@ p.write_text(json.dumps(state))
                                           ["select", "订阅 B", "节点 B2"]])
         self.assertEqual(mode.Controller.selection_path(state["proxies"], "GLOBAL")[-1], "节点 B2")
         self.assertIn("GLOBAL 同步跟随", result.stdout)
+
+    def test_authentication_failure_stops_before_fallback(self):
+        self.secret_file.write_text("wrong-test-key\n")
+        result = self.select("1\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 401", result.stderr)
+        self.assertNotIn("wrong-test-key", result.stderr)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["requests"], [["GET", "代理选择", 401]])
+        self.assertEqual(state["events"], [])
+
+    def test_missing_entry_uses_authenticated_base_group(self):
+        self.environment["MIHOMO_ENTRY_GROUP"] = "missing"
+        self.environment["MIHOMO_BASE_GROUP"] = "代理选择"
+        result = self.select("3\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["requests"][:2], [["GET", "missing", 404], ["GET", "代理选择", 200]])
+        self.assertEqual(state["events"][0], ["sync", "代理选择"])
 
     def test_direct_choice_also_synchronizes_global(self):
         result = self.select("3\n")
